@@ -1,0 +1,2370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pixel Puppets</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#1a1c2c;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  /* The one visible canvas. Integer-scaled; letterboxing comes from the body background. */
+  #screen{image-rendering:pixelated;image-rendering:crisp-edges;cursor:default;outline:none}
+  /* DOM overlay used only for the exported-video review player. Its text labels are
+     rendered through the same bitmap font into small canvases (see makeTextCanvas). */
+  #reviewOverlay{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px;background:#1a1c2c;z-index:10}
+  #reviewOverlay.open{display:flex}
+  #reviewVideo{image-rendering:pixelated;border:4px solid #566c86;max-width:82vw;max-height:70vh;background:#000}
+  .pixbtn{background:#29366f;border:2px solid #94b0c2;padding:6px 12px;cursor:pointer;display:flex;
+    align-items:center;justify-content:center}
+  .pixbtn:hover{background:#3b5dc9}
+  .pixbtn canvas{image-rendering:pixelated;display:block}
+</style>
+</head>
+<body>
+<canvas id="screen" width="640" height="360"></canvas>
+<div id="reviewOverlay">
+  <video id="reviewVideo" controls loop></video>
+  <div style="display:flex;gap:12px">
+    <div class="pixbtn" id="saveAgainBtn"></div>
+    <div class="pixbtn" id="closeReviewBtn"></div>
+  </div>
+</div>
+<input type="file" id="importFile" accept="application/json,.json" style="display:none">
+<script>
+"use strict";
+/* ============================================================================
+   PIXEL PUPPETS
+   A pixel-art puppet-show toy. Everything on screen is drawn in code onto a
+   320x180 internal canvas which is blitted to the display canvas at a whole
+   integer scale factor. No image files, no web fonts, no anti-aliasing.
+   ==========================================================================*/
+
+/* ---- Internal resolution ------------------------------------------------ */
+const IW = 320, IH = 180;
+const STEP = 1000 / 60;           // fixed timestep (ms) for movement/animation
+
+/* ---- Palette ------------------------------------------------------------
+   The only 16 colors in the game (Sweetie-16). Sprite pixel data refers to
+   these by index using single hex characters '0'-'f'; '.' = transparent.   */
+const PAL = [
+  "#1a1c2c", // 0 NIGHT   (outlines, letterbox)
+  "#5d275d", // 1 PLUM
+  "#b13e53", // 2 RED
+  "#ef7d57", // 3 ORANGE
+  "#ffcd75", // 4 SAND    (default skin)
+  "#a7f070", // 5 LIME
+  "#38b764", // 6 GREEN
+  "#257179", // 7 TEAL
+  "#29366f", // 8 NAVY
+  "#3b5dc9", // 9 BLUE    (canonical "recolor me" channel in costume art)
+  "#41a6f6", // a SKY
+  "#73eff7", // b ICE
+  "#f4f4f4", // c WHITE
+  "#94b0c2", // d SILVER
+  "#566c86", // e SLATE
+  "#333c57"  // f DUSK
+];
+const NIGHT=0, PLUM=1, RED=2, ORANGE=3, SAND=4, LIME=5, GREEN=6, TEAL=7,
+      NAVY=8, BLUE=9, SKY=10, ICE=11, WHITE=12, SILVER=13, SLATE=14, DUSK=15;
+const RECOLOR = BLUE;  // costume art draws its recolorable channel in this index
+const SKINC   = SAND;  // costume art draws skin in this index
+
+/* ---- Canvas plumbing ---------------------------------------------------- */
+function makeCanvas(w, h) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const x = c.getContext("2d");
+  x.imageSmoothingEnabled = false;      // required on EVERY context
+  return [c, x];
+}
+
+const display = document.getElementById("screen");
+const dctx = display.getContext("2d");
+const [screen, sctx] = makeCanvas(IW, IH);   // everything renders here first
+
+let SCALE = 2;
+function resize() {
+  // Whole-number scale only; leftover space is letterboxed by the page bg.
+  SCALE = Math.max(1, Math.floor(Math.min(window.innerWidth / IW, window.innerHeight / IH)));
+  display.width = IW * SCALE;
+  display.height = IH * SCALE;
+  dctx.imageSmoothingEnabled = false;   // resets when canvas is resized
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---- Tiny drawing helpers (integer coords only) ------------------------- */
+function rect(ctx, x, y, w, h, ci) {
+  ctx.fillStyle = PAL[ci];
+  ctx.fillRect(x | 0, y | 0, w | 0, h | 0);
+}
+function px(ctx, x, y, ci) { rect(ctx, x, y, 1, 1, ci); }
+function frameRect(ctx, x, y, w, h, ci) {   // 1px hollow border
+  rect(ctx, x, y, w, 1, ci); rect(ctx, x, y + h - 1, w, 1, ci);
+  rect(ctx, x, y, 1, h, ci); rect(ctx, x + w - 1, y, 1, h, ci);
+}
+function panel(ctx, x, y, w, h, bg, border) {
+  rect(ctx, x, y, w, h, bg);
+  frameRect(ctx, x, y, w, h, border);
+}
+/* 1px dashed rectangle drawn pixel-by-pixel so dashes sit on integer bounds. */
+function dashRect(ctx, x, y, w, h, ci, phase) {
+  ctx.fillStyle = PAL[ci];
+  const on = (i) => (((i + phase) >> 1) & 1) === 0;   // 2px dashes
+  for (let i = 0; i < w; i++) { if (on(i)) ctx.fillRect(x + i, y, 1, 1); if (on(i + h)) ctx.fillRect(x + w - 1 - i, y + h - 1, 1, 1); }
+  for (let i = 0; i < h; i++) { if (on(i + w)) ctx.fillRect(x + w - 1, y + i, 1, 1); if (on(i + h + w)) ctx.fillRect(x, y + h - 1 - i, 1, 1); }
+}
+
+/* Deterministic PRNG for backdrop texture so scenes look identical every load. */
+function RNG(seed) {
+  let s = seed >>> 0;
+  return function () { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+}
+
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+/* ============================================================================
+   BITMAP FONT
+   Glyph format: one string per glyph; rows separated by '|'. 'X' = pixel on,
+   '.' (or anything else) = off. Cell is up to 5 wide x 7 tall; row 6 is the
+   descender row. Advance width = glyph width + 1 (proportional spacing).
+   To add a glyph: add an entry here — nothing else is needed.
+   ==========================================================================*/
+const GLYPHS = {
+  "A": ".XX.|X..X|X..X|XXXX|X..X|X..X",
+  "B": "XXX.|X..X|XXX.|X..X|X..X|XXX.",
+  "C": ".XXX|X...|X...|X...|X...|.XXX",
+  "D": "XXX.|X..X|X..X|X..X|X..X|XXX.",
+  "E": "XXXX|X...|XXX.|X...|X...|XXXX",
+  "F": "XXXX|X...|XXX.|X...|X...|X...",
+  "G": ".XXX|X...|X.XX|X..X|X..X|.XX.",
+  "H": "X..X|X..X|XXXX|X..X|X..X|X..X",
+  "I": "XXX|.X.|.X.|.X.|.X.|XXX",
+  "J": "..XX|...X|...X|...X|X..X|.XX.",
+  "K": "X..X|X.X.|XX..|XX..|X.X.|X..X",
+  "L": "X...|X...|X...|X...|X...|XXXX",
+  "M": "X...X|XX.XX|X.X.X|X.X.X|X...X|X...X",
+  "N": "X..X|XX.X|XX.X|X.XX|X.XX|X..X",
+  "O": ".XX.|X..X|X..X|X..X|X..X|.XX.",
+  "P": "XXX.|X..X|X..X|XXX.|X...|X...",
+  "Q": ".XX.|X..X|X..X|X..X|X.X.|.X.X",
+  "R": "XXX.|X..X|X..X|XXX.|X.X.|X..X",
+  "S": ".XXX|X...|.XX.|...X|...X|XXX.",
+  "T": "XXX|.X.|.X.|.X.|.X.|.X.",
+  "U": "X..X|X..X|X..X|X..X|X..X|.XX.",
+  "V": "X...X|X...X|X...X|.X.X.|.X.X.|..X..",
+  "W": "X...X|X...X|X.X.X|X.X.X|XX.XX|X...X",
+  "X": "X..X|X..X|.XX.|.XX.|X..X|X..X",
+  "Y": "X...X|.X.X.|..X..|..X..|..X..|..X..",
+  "Z": "XXXX|...X|..X.|.X..|X...|XXXX",
+  "a": "|.XX.|...X|.XXX|X..X|.XXX",
+  "b": "X...|X...|XXX.|X..X|X..X|XXX.",
+  "c": "|.XX.|X...|X...|X...|.XX.",
+  "d": "...X|...X|.XXX|X..X|X..X|.XXX",
+  "e": "|.XX.|X..X|XXXX|X...|.XXX",
+  "f": ".XX|X..|XX.|X..|X..|X..",
+  "g": "|.XXX|X..X|X..X|.XXX|...X|.XX.",
+  "h": "X...|X...|XXX.|X..X|X..X|X..X",
+  "i": "X|.|X|X|X|X",
+  "j": "..X|...|..X|..X|..X|..X|XX.",
+  "k": "X..|X..|X.X|XX.|XX.|X.X",
+  "l": "X|X|X|X|X|X",
+  "m": "|XXXX.|X.X.X|X.X.X|X.X.X|X.X.X",
+  "n": "|XXX.|X..X|X..X|X..X|X..X",
+  "o": "|.XX.|X..X|X..X|X..X|.XX.",
+  "p": "|XXX.|X..X|X..X|XXX.|X...|X...",
+  "q": "|.XXX|X..X|X..X|.XXX|...X|...X",
+  "r": "|X.XX|XX..|X...|X...|X...",
+  "s": "|.XXX|X...|.XX.|...X|XXX.",
+  "t": ".X.|XXX|.X.|.X.|.X.|.XX",
+  "u": "|X..X|X..X|X..X|X..X|.XXX",
+  "v": "|X.X|X.X|X.X|X.X|.X.",
+  "w": "|X...X|X...X|X.X.X|X.X.X|.X.X.",
+  "x": "|X.X|X.X|.X.|X.X|X.X",
+  "y": "|X..X|X..X|X..X|.XXX|...X|.XX.",
+  "z": "|XXXX|..X.|.X..|X...|XXXX",
+  "0": ".XX.|X..X|X.XX|XX.X|X..X|.XX.",
+  "1": ".X.|XX.|.X.|.X.|.X.|XXX",
+  "2": ".XX.|X..X|...X|..X.|.X..|XXXX",
+  "3": "XXX.|...X|.XX.|...X|...X|XXX.",
+  "4": "..XX|.X.X|X..X|XXXX|...X|...X",
+  "5": "XXXX|X...|XXX.|...X|...X|XXX.",
+  "6": ".XX.|X...|XXX.|X..X|X..X|.XX.",
+  "7": "XXXX|...X|..X.|..X.|.X..|.X..",
+  "8": ".XX.|X..X|.XX.|X..X|X..X|.XX.",
+  "9": ".XX.|X..X|X..X|.XXX|...X|.XX.",
+  " ": "..|..",
+  ".": "|||||X",
+  ",": "|||||.X|X.",
+  "!": "X|X|X|X|.|X",
+  "?": ".XX.|X..X|...X|..X.|....|..X.",
+  ":": "||X|||X",
+  ";": "||.X|||.X|X.",
+  "'": "X|X",
+  "\"": "X.X|X.X",
+  "(": ".X|X.|X.|X.|X.|.X",
+  ")": "X.|.X|.X|.X|.X|X.",
+  "-": "|||XXX",
+  "+": "||.X.|XXX|.X.",
+  "=": "||XXX||XXX",
+  "/": "..X|..X|.X.|.X.|X..|X..",
+  "_": "||||||XXXX",
+  "*": "|X.X|.X.|X.X",
+  "<": "|..X|.X.|X..|.X.|..X",
+  ">": "|X..|.X.|..X|.X.|X..",
+  "[": "XX|X.|X.|X.|X.|XX",
+  "]": "XX|.X|.X|.X|.X|XX",
+  "%": "X..X|...X|..X.|.X..|X...|X..X"
+};
+
+/* Parse glyphs once: {w, rows[7]} per char. */
+const FONT = {};
+const FONT_H = 7;
+for (const ch in GLYPHS) {
+  const rows = GLYPHS[ch].split("|");
+  let w = 1;
+  for (const r of rows) w = Math.max(w, r.length);
+  while (rows.length < FONT_H) rows.push("");
+  FONT[ch] = { w, rows };
+}
+const FALLBACK = { w: 4, rows: ["XXXX", "X..X", "X..X", "X..X", "X..X", "XXXX", ""] };
+
+/* One pre-rendered atlas canvas per palette color, built lazily. */
+const fontAtlases = new Map();   // colorIndex -> {canvas, pos: {ch: xOffset}}
+function fontAtlas(ci) {
+  let a = fontAtlases.get(ci);
+  if (a) return a;
+  let total = 0;
+  for (const ch in FONT) total += FONT[ch].w + 1;
+  total += FALLBACK.w + 1;
+  const [cv, cx] = makeCanvas(total, FONT_H);
+  cx.fillStyle = PAL[ci];
+  const pos = {};
+  let x = 0;
+  const blit = (ch, g) => {
+    pos[ch] = x;
+    for (let ry = 0; ry < FONT_H; ry++) {
+      const row = g.rows[ry];
+      for (let rx = 0; rx < row.length; rx++) if (row[rx] === "X") cx.fillRect(x + rx, ry, 1, 1);
+    }
+    x += g.w + 1;
+  };
+  for (const ch in FONT) blit(ch, FONT[ch]);
+  blit("�", FALLBACK);
+  a = { canvas: cv, pos };
+  fontAtlases.set(ci, a);
+  return a;
+}
+
+function glyphOf(ch) { return FONT[ch] || FALLBACK; }
+function textW(s, scale) {
+  scale = scale || 1;
+  let w = 0;
+  for (const ch of s) w += (glyphOf(ch).w + 1);
+  return Math.max(0, w - 1) * scale;
+}
+/* Draw text at integer position. scale must be a whole number (1 = 5x7-ish,
+   2 = double-size heading variant produced by integer scaling of the same data). */
+function drawText(ctx, s, x, y, ci, scale) {
+  scale = scale || 1;
+  x = Math.floor(x); y = Math.floor(y);
+  const a = fontAtlas(ci);
+  for (const ch of s) {
+    const g = glyphOf(ch);
+    const gx = (ch in a.pos) ? a.pos[ch] : a.pos["�"];
+    ctx.drawImage(a.canvas, gx, 0, g.w, FONT_H, x, y, g.w * scale, FONT_H * scale);
+    x += (g.w + 1) * scale;
+  }
+}
+function drawTextC(ctx, s, cx, y, ci, scale) { drawText(ctx, s, cx - Math.floor(textW(s, scale) / 2), y, ci, scale); }
+function drawTextR(ctx, s, rx, y, ci, scale) { drawText(ctx, s, rx - textW(s, scale), y, ci, scale); }
+/* Word-wrapping variant for multi-line text. Returns the y below the last line. */
+function drawTextWrap(ctx, s, x, y, maxW, ci, lineH, scale) {
+  lineH = lineH || 8; scale = scale || 1;
+  const words = s.split(" ");
+  let line = "";
+  for (const wd of words) {
+    const test = line ? line + " " + wd : wd;
+    if (textW(test, scale) > maxW && line) { drawText(ctx, line, x, y, ci, scale); y += lineH; line = wd; }
+    else line = test;
+  }
+  if (line) { drawText(ctx, line, x, y, ci, scale); y += lineH; }
+  return y;
+}
+/* Render a text label into its own small canvas (used for the few DOM buttons
+   on the export-review overlay, so even DOM UI uses the bitmap font). */
+function makeTextCanvas(s, ci, scale) {
+  scale = scale || 2;
+  const [cv, cx] = makeCanvas(Math.max(1, textW(s, scale)), FONT_H * scale);
+  drawText(cx, s, 0, 0, ci, scale);
+  return cv;
+}
+/* ============================================================================
+   SPRITE SYSTEM
+   Pixel-data format: an array of strings, one string per row. Each character
+   is one pixel: '0'-'9' and 'a'-'f' are palette indices 0-15, '.' (or space)
+   is transparent. Example:
+
+     [".99.",
+      "9449",
+      ".99."]
+
+   Sprites are decoded once into offscreen canvases and blitted at integer
+   positions. A horizontally flipped copy is pre-generated by reversing each
+   row of the pixel data (never with a negative ctx.scale), so mirroring is
+   pixel-exact.
+   Recoloring is done by remapping palette indices while decoding (remap is a
+   {srcIndex: dstIndex} object) — never by tinting or alpha blending.
+   ==========================================================================*/
+
+function rowsW(rows) { let w = 0; for (const r of rows) w = Math.max(w, r.length); return w; }
+
+function flipRows(rows) {
+  const w = rowsW(rows);
+  return rows.map(r => (r + ".".repeat(w - r.length)).split("").reverse().join(""));
+}
+
+function canvasFromRows(rows, remap) {
+  const w = Math.max(1, rowsW(rows)), h = Math.max(1, rows.length);
+  const [cv, cx] = makeCanvas(w, h);
+  for (let y = 0; y < rows.length; y++) {
+    const row = rows[y];
+    for (let x = 0; x < row.length; x++) {
+      const ch = row[x];
+      if (ch === "." || ch === " ") continue;
+      let ci = parseInt(ch, 16);
+      if (isNaN(ci)) continue;
+      if (remap && remap[ci] !== undefined) ci = remap[ci];
+      cx.fillStyle = PAL[ci];
+      cx.fillRect(x, y, 1, 1);
+    }
+  }
+  return cv;
+}
+
+/* Cache of decoded sprites keyed by pixel data + remap, since many puppets
+   share the same costume option with the same colors. */
+const spriteCache = new Map();
+function sprite(rows, remap) {
+  const key = rows.join("|") + "#" + (remap ? JSON.stringify(remap) : "");
+  let s = spriteCache.get(key);
+  if (s) return s;
+  s = {
+    w: rowsW(rows), h: rows.length,
+    cv: canvasFromRows(rows, remap),          // facing right
+    fcv: canvasFromRows(flipRows(rows), remap) // facing left (pre-flipped data)
+  };
+  spriteCache.set(key, s);
+  return s;
+}
+
+/* Blit helper honoring facing. Offsets (ox,oy) are authored for a puppet that
+   faces RIGHT, relative to its origin; when facing left the x offset mirrors
+   about the origin. All destination coords are floored at the moment of draw. */
+function blitPart(ctx, s, originX, originY, ox, oy, facing) {
+  const dx = facing >= 0 ? originX + ox : originX - ox - s.w;
+  ctx.drawImage(facing >= 0 ? s.cv : s.fcv, Math.floor(dx), Math.floor(originY + oy));
+  return { x: Math.floor(dx), y: Math.floor(originY + oy), w: s.w, h: s.h };
+}
+/* ============================================================================
+   PUPPET PARTS LIBRARY
+   A puppet is layered parts blitted at integer offsets from the feet origin
+   (x = center of the puppet, y = ground line), authored facing RIGHT.
+
+   Skeleton and draw order (z): left arm(0), left leg+shoe(1), right leg+
+   shoe(2), torso(3), head(4), jaw(5), face(6), hair(7), hat(8),
+   right arm(9), held item(10).
+
+   POSE FRAMES — limbs never rotate. Each arm/leg option supplies 5 discrete
+   frames (fully forward ... fully back). A frame is generated from a
+   hardcoded centerline: a list of [x,y] points from the pivot (shoulder/hip)
+   to the extremity. Each point is painted 2px wide; a per-option painter
+   chooses the palette index per point (sleeve vs skin, stripes, armor...).
+   The generated frame records:
+     sprite  - decoded pixel sprite (with pre-flipped copy)
+     ox, oy  - integer offset of the sprite from the pivot
+     end     - [x,y] of the extremity (hand/foot) relative to the pivot,
+               used to attach shoes and held items.
+   To add a new limb option: add {id,name,paint} to ARM_OPTIONS/LEG_OPTIONS.
+   To add a new pose: add a centerline to ARM_LINES/LEG_LINES.
+   ==========================================================================*/
+
+/* Limb centerlines, pivot at [0,0]. Index 0 = fully forward, last = fully back. */
+const ARM_LINES = [
+  [[0,0],[1,1],[2,2],[3,3],[4,4],[4,5]],      // fully forward
+  [[0,0],[1,1],[1,2],[2,3],[2,4],[2,5]],      // forward
+  [[0,0],[0,1],[0,2],[0,3],[0,4],[0,5]],      // neutral (hanging)
+  [[0,0],[-1,1],[-1,2],[-2,3],[-2,4],[-2,5]], // back
+  [[0,0],[-1,1],[-2,2],[-3,3],[-4,4],[-4,5]]  // fully back
+];
+const LEG_LINES = [
+  [[0,0],[1,1],[2,2],[3,3],[3,4],[3,5]],      // fully forward (foot lifted)
+  [[0,0],[1,1],[1,2],[2,3],[2,4],[2,5],[2,6]],// forward
+  [[0,0],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6]],// neutral (standing)
+  [[0,0],[-1,1],[-1,2],[-2,3],[-2,4],[-2,5],[-2,6]], // back
+  [[0,0],[-1,1],[-2,2],[-3,3],[-3,4],[-3,5]]  // fully back (foot lifted)
+];
+const NEUTRAL_FRAME = 2;   // index of the standing frame in the sets above
+
+/* Build one limb frame: paint the centerline into a grid, return rows+meta.
+   painter(i, n) -> palette char for point i of n ('4' skin, '9' recolor...). */
+function buildLimbFrame(line, painter, thick) {
+  let minX = 99, minY = 99, maxX = -99, maxY = -99;
+  for (const [x, y] of line) {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x + thick - 1);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  const w = maxX - minX + 1, h = maxY - minY + 1;
+  const grid = Array.from({ length: h }, () => Array(w).fill("."));
+  line.forEach(([x, y], i) => {
+    const ch = painter(i, line.length);
+    for (let t = 0; t < thick; t++) grid[y - minY][x - minX + t] = ch;
+  });
+  const rows = grid.map(r => r.join(""));
+  const end = line[line.length - 1];
+  return { rows, ox: minX, oy: minY, end: [end[0], end[1]] };
+}
+function buildLimbSet(lines, painter, thick) {
+  return lines.map(l => buildLimbFrame(l, painter, thick));
+}
+
+/* Limb costume options. '9' is the recolor channel, '4' skin, 'd' metal,
+   'c' white. Each option generates the FULL pose set. */
+const ARM_OPTIONS = [
+  { id: "short",  name: "TEE",     paint: (i, n) => i < 2 ? "9" : "4" },
+  { id: "long",   name: "SLEEVE",  paint: (i, n) => i < n - 1 ? "9" : "4" },
+  { id: "armor",  name: "ARMOR",   paint: (i, n) => i < n - 1 ? (i % 2 ? "d" : "9") : "4" },
+  { id: "stripe", name: "STRIPES", paint: (i, n) => i < n - 1 ? (i % 2 ? "c" : "9") : "4" },
+  { id: "robe",   name: "ROBE",    paint: (i, n) => "9" },
+  { id: "bare",   name: "BARE",    paint: (i, n) => i === 3 ? "9" : "4" }  // wristband
+];
+const LEG_OPTIONS = [
+  { id: "pants",  name: "PANTS",   paint: (i, n) => i < n - 1 ? "9" : "4" },
+  { id: "shorts", name: "SHORTS",  paint: (i, n) => i < 3 ? "9" : "4" },
+  { id: "stripe", name: "STRIPES", paint: (i, n) => i < n - 1 ? (i % 2 ? "c" : "9") : "4" },
+  { id: "armor",  name: "ARMOR",   paint: (i, n) => i < n - 1 ? (i % 2 ? "d" : "9") : "4" },
+  { id: "dots",   name: "DOTTED",  paint: (i, n) => i < n - 1 ? (i % 3 === 1 ? "c" : "9") : "4" },
+  { id: "bare",   name: "BARE",    paint: (i, n) => "4" }
+];
+
+/* ---- Static part pixel art ----------------------------------------------
+   Head grid is 12x10, drawn at offset (-6,-30) from the feet origin.
+   '4' = skin (remapped per character), '0' = outline.                      */
+const HEAD_OPTIONS = [
+  { id: "round", name: "ROUND", rows: [
+    "..00000000..",
+    ".0444444440.",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    ".0444444440.",
+    "..04444440..",
+    "...000000..."] },
+  { id: "square", name: "SQUARE", rows: [
+    ".0000000000.",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    ".0000000000."] },
+  { id: "wide", name: "WIDE", rows: [
+    "..00000000..",
+    ".0444444440.",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    ".0444444440.",
+    "..00000000.."] },
+  { id: "slim", name: "SLIM", rows: [
+    "..00000000..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..00000000.."] },
+  { id: "egg", name: "EGG", rows: [
+    "...000000...",
+    "..04444440..",
+    ".0444444440.",
+    ".0444444440.",
+    "044444444440",
+    "044444444440",
+    "044444444440",
+    ".0444444440.",
+    "..04444440..",
+    "...000000..."] },
+  { id: "small", name: "SMALL", rows: [
+    "............",
+    "............",
+    "..00000000..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..04444440..",
+    "..00000000.."] }
+];
+
+/* Hair: drawn over the head. dy is relative to the head's top row (-30). */
+const HAIR_OPTIONS = [
+  { id: "none", name: "NONE", rows: null, dy: 0 },
+  { id: "spiky", name: "SPIKY", dy: -2, rows: [
+    "9.9..9..9.9.",
+    "999999999999",
+    ".9999999999."] },
+  { id: "bob", name: "BOB", dy: -1, rows: [
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "99........99",
+    "99........99",
+    "9..........9"] },
+  { id: "long", name: "LONG", dy: -1, rows: [
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "99........99",
+    "99........99",
+    "99........99",
+    "99........99",
+    "99........99",
+    "99........99",
+    ".9........9."] },
+  { id: "mohawk", name: "MOHAWK", dy: -5, rows: [
+    ".....99.....",
+    ".....99.....",
+    "....9999....",
+    "....9999....",
+    "...999999...",
+    "..99999999.."] },
+  { id: "curly", name: "CURLY", dy: -3, rows: [
+    ".99.9999.99.",
+    "999999999999",
+    "999999999999",
+    "9.99....99.9"] },
+  { id: "pony", name: "PONYTAIL", dy: -1, rows: [
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "99........99",
+    "9...........",
+    "99..........",
+    ".9..........",
+    ".99........."] }
+];
+
+/* Hats: dy relative to head top row. */
+const HAT_OPTIONS = [
+  { id: "none", name: "NONE", rows: null, dy: 0 },
+  { id: "cap", name: "CAP", dy: -3, rows: [
+    "..999999....",
+    ".99999999...",
+    ".9999999999."] },
+  { id: "tophat", name: "TOP HAT", dy: -7, rows: [
+    "...999999...",
+    "...999999...",
+    "...999999...",
+    "...9c9999...",
+    "...999999...",
+    ".9999999999.",
+    "999999999999"] },
+  { id: "crown", name: "CROWN", dy: -4, rows: [
+    ".9.9.99.9.9.",
+    ".9999999999.",
+    ".9299999929.",
+    ".9999999999."] },
+  { id: "wizard", name: "WIZARD", dy: -9, rows: [
+    "......9.....",
+    ".....99.....",
+    ".....999....",
+    "....9999....",
+    "....99999...",
+    "...99c999...",
+    "...9999999..",
+    "..999999999.",
+    ".9999999999."] },
+  { id: "helmet", name: "HELMET", dy: -2, rows: [
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "9d........d9",
+    "9d........d9",
+    "9d........d9"] },
+  { id: "bow", name: "BOW", dy: -3, rows: [
+    ".........9.9",
+    ".........999",
+    ".........9.9"] }
+];
+
+/* Faces: eyes/eyewear, 10 wide, drawn at (-5, headTop + 3). Each option has
+   an open and a blink (closed) variant — both plain pixel data.            */
+const FACE_OPTIONS = [
+  { id: "dot", name: "DOT EYES",
+    open: ["...0...0..", ".........."],
+    closed: ["..........", "...0...0.."] },
+  { id: "big", name: "BIG EYES",
+    open: ["..00..00..", "..0c..0c.."],
+    closed: ["..........", "..00..00.."] },
+  { id: "glasses", name: "GLASSES",
+    open: [".000..000.", ".0.0000.0.", ".000..000."],
+    closed: [".000..000.", ".00000000.", ".000..000."] },
+  { id: "shades", name: "SHADES",
+    open: [".ffffffff.", ".fff..fff."],
+    closed: [".ffffffff.", ".fff..fff."] },
+  { id: "wink", name: "WINK",
+    open: [".......0..", "...0...0.."],
+    closed: ["..........", "...0...0.."] },
+  { id: "freckle", name: "FRECKLES",
+    open: ["...0...0..", "..2..2..2."],
+    closed: ["..........", "...0...0.."] }
+];
+
+/* Torsos: 12x10 grid drawn at (-6,-20). '9' recolor, 'c' white, 'd' metal. */
+const TORSO_OPTIONS = [
+  { id: "tee", name: "TEE", rows: [
+    "..99999999..",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999."] },
+  { id: "stripes", name: "STRIPES", rows: [
+    "..99999999..",
+    ".cccccccccc.",
+    ".9999999999.",
+    ".cccccccccc.",
+    ".9999999999.",
+    ".cccccccccc.",
+    ".9999999999.",
+    ".cccccccccc.",
+    ".9999999999.",
+    ".cccccccccc."] },
+  { id: "overalls", name: "OVERALLS", rows: [
+    "..cccccccc..",
+    ".cc9cccc9cc.",
+    ".cc9cccc9cc.",
+    ".cc999999cc.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999."] },
+  { id: "armor", name: "ARMOR", rows: [
+    "..dddddddd..",
+    ".dddddddddd.",
+    ".dd9dddd9dd.",
+    ".dddddddddd.",
+    ".dddddddddd.",
+    ".dddddddddd.",
+    ".9999999999.",
+    ".dddddddddd.",
+    ".dddddddddd.",
+    ".dddddddddd."] },
+  { id: "hoodie", name: "HOODIE", rows: [
+    "999999999999",
+    "999999999999",
+    ".999c99c999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".99f9999f99.",
+    ".99ffffff99.",
+    ".9999999999."] },
+  { id: "dress", name: "DRESS", rows: [
+    "..99999999..",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "999999999999",
+    "999999999999"] }
+];
+
+/* Shoes: small sprite stamped at each leg frame's foot position. */
+const SHOE_OPTIONS = [
+  { id: "sneaker", name: "SNEAKER", rows: ["9999", "cccc"] },
+  { id: "boot",    name: "BOOT",    rows: ["99..", "9999", "9999"] },
+  { id: "bare",    name: "BARE",    rows: ["4444", "4444"] },
+  { id: "sandal",  name: "SANDAL",  rows: ["4444", "9.9."] },
+  { id: "heel",    name: "HEELS",   rows: ["9999", "9..9"] },
+  { id: "clown",   name: "CLOWN",   rows: [".2222", "22222"] }
+];
+
+/* Held items: anchor [ax,ay] is the pixel that sits on the hand. */
+const ITEM_OPTIONS = [
+  { id: "none", name: "NONE", rows: null, ax: 0, ay: 0 },
+  { id: "sword", name: "SWORD", ax: 1, ay: 6, rows: [
+    ".c.",
+    ".c.",
+    ".c.",
+    ".c.",
+    ".c.",
+    "444",
+    ".3.",
+    ".3."] },
+  { id: "wand", name: "WAND", ax: 1, ay: 5, rows: [
+    "4.4",
+    ".4.",
+    "4.4",
+    ".f.",
+    ".f.",
+    ".f.",
+    ".f."] },
+  { id: "balloon", name: "BALLOON", ax: 2, ay: 9, rows: [
+    ".999.",
+    "9c999",
+    "99999",
+    "99999",
+    ".999.",
+    "..9..",
+    "..0..",
+    "..0..",
+    "..0..",
+    "..0.."] },
+  { id: "book", name: "BOOK", ax: 3, ay: 3, rows: [
+    "999999",
+    "9cccc9",
+    "9cccc9",
+    "999999"] },
+  { id: "mic", name: "MIC", ax: 1, ay: 5, rows: [
+    "ddd",
+    "ddd",
+    ".0.",
+    ".0.",
+    ".0.",
+    ".0."] },
+  { id: "flag", name: "FLAG", ax: 0, ay: 7, rows: [
+    "d9999",
+    "d9999",
+    "d999.",
+    "d99..",
+    "d....",
+    "d....",
+    "d....",
+    "d...."] }
+];
+
+/* Jaw states drawn over the chin: 0 closed, 1 open, 2 wide. '1'=mouth dark,
+   '2'=tongue. Positioned at (mouth offset) from the head top-left.         */
+const JAW_SPRITES = [
+  ["0000"],
+  ["0000", "0110", ".00."],
+  ["0000", "0110", "0210", ".00."]
+];
+
+/* ---- Rig geometry: integer offsets from the feet origin (facing right) -- */
+const RIG = {
+  head:   { ox: -6, oy: -30 },
+  faceDx: -5, faceDy: 3,       // relative to head top(-30): eyes line
+  mouthDx: -1, mouthDy: -24,   // jaw top-left, from origin (biased toward facing)
+  torso:  { ox: -6, oy: -20 },
+  shoulderR: { x: 5,  y: -19 },
+  shoulderL: { x: -7, y: -19 },
+  hipR: { x: 2,  y: -10 },
+  hipL: { x: -4, y: -10 },
+  shoeDx: -1, shoeDy: 1        // shoe sprite offset from a leg frame's foot end
+};
+
+/* Slot registry used by the character builder + serialization.
+   kind: "list" options are looked up by id. colorable slots expose a palette
+   remap channel (canonical index 9 -> chosen palette index).               */
+const SLOT_DEFS = [
+  { slot: "head",  label: "HEAD",  options: HEAD_OPTIONS,  colorable: false },
+  { slot: "hair",  label: "HAIR",  options: HAIR_OPTIONS,  colorable: true },
+  { slot: "hat",   label: "HAT",   options: HAT_OPTIONS,   colorable: true },
+  { slot: "face",  label: "FACE",  options: FACE_OPTIONS,  colorable: false },
+  { slot: "torso", label: "SHIRT", options: TORSO_OPTIONS, colorable: true },
+  { slot: "arms",  label: "ARMS",  options: ARM_OPTIONS,   colorable: true },
+  { slot: "legs",  label: "LEGS",  options: LEG_OPTIONS,   colorable: true },
+  { slot: "shoes", label: "SHOES", options: SHOE_OPTIONS,  colorable: true },
+  { slot: "item",  label: "ITEM",  options: ITEM_OPTIONS,  colorable: true }
+];
+function optionById(list, id) {
+  for (const o of list) if (o.id === id) return o;
+  return list[0];
+}
+
+/* Pre-build limb frame data (geometry only; sprites are decoded per remap). */
+for (const o of ARM_OPTIONS) o.frames = buildLimbSet(ARM_LINES, o.paint, 2);
+for (const o of LEG_OPTIONS) o.frames = buildLimbSet(LEG_LINES, o.paint, 2);
+/* ============================================================================
+   BACKDROPS — four full 320x180 scenes, painted once into offscreen canvases
+   at load using only palette-indexed rects/pixels. The floor band (where
+   puppets stand) is roughly y = 96..180.
+   ==========================================================================*/
+
+function paintCastle(c) {
+  const r = RNG(7);
+  rect(c, 0, 0, IW, IH, SLATE);
+  // stone block courses
+  for (let y = 0; y < 96; y += 12) {
+    rect(c, 0, y, IW, 1, DUSK);
+    const off = (y / 12) % 2 ? 12 : 0;
+    for (let x = off; x < IW; x += 24) rect(c, x, y, 1, 12, DUSK);
+  }
+  // random darker stones
+  for (let i = 0; i < 40; i++) {
+    const gx = Math.floor(r() * 13), gy = Math.floor(r() * 8);
+    rect(c, gx * 24 + ((gy % 2) ? 12 : 0) + 1, gy * 12 + 1, 23, 11, r() < 0.5 ? SLATE : DUSK);
+  }
+  // columns
+  for (const x of [24, 152, 280]) {
+    rect(c, x, 0, 16, 100, SILVER);
+    rect(c, x, 0, 2, 100, WHITE); rect(c, x + 14, 0, 2, 100, SLATE);
+    rect(c, x - 2, 96, 20, 6, SILVER); rect(c, x - 2, 96, 20, 1, WHITE);
+  }
+  // banners
+  for (const x of [72, 200]) {
+    rect(c, x, 8, 24, 34, RED);
+    rect(c, x, 8, 24, 3, ORANGE);
+    rect(c, x + 2, 36, 4, 8, RED); rect(c, x + 10, 38, 4, 8, RED); rect(c, x + 18, 36, 4, 8, RED);
+    rect(c, x + 8, 18, 8, 8, SAND); rect(c, x + 10, 14, 4, 4, SAND);
+  }
+  // torches
+  for (const x of [126, 254]) {
+    rect(c, x, 40, 4, 12, DUSK);
+    rect(c, x, 34, 4, 6, ORANGE); rect(c, x + 1, 30, 2, 4, SAND);
+  }
+  // window
+  rect(c, 300, 10, 14, 30, NIGHT); rect(c, 302, 12, 10, 26, NAVY);
+  px(c, 305, 16, WHITE); px(c, 309, 24, WHITE);
+  // floor: checkered flagstones
+  rect(c, 0, 96, IW, IH - 96, DUSK);
+  for (let y = 96; y < IH; y += 12)
+    for (let x = 0; x < IW; x += 12)
+      if (((x + y) / 12) % 2 < 1) rect(c, x, y, 12, 12, SLATE);
+  rect(c, 0, 96, IW, 2, NIGHT);
+}
+
+function paintForest(c) {
+  const r = RNG(21);
+  rect(c, 0, 0, IW, 96, SKY);
+  // sun
+  rect(c, 262, 12, 18, 18, SAND); rect(c, 266, 8, 10, 26, SAND); rect(c, 258, 16, 26, 10, SAND);
+  // clouds
+  for (const [x, y, w] of [[30, 18, 40], [130, 30, 30], [210, 12, 36]]) {
+    rect(c, x, y, w, 8, WHITE); rect(c, x + 6, y - 4, w - 12, 4, WHITE);
+  }
+  // far hills
+  rect(c, 0, 70, IW, 26, GREEN);
+  for (let x = 0; x < IW; x += 8) rect(c, x, 66 + ((x / 8) % 3 === 0 ? 0 : 2), 8, 6, GREEN);
+  // trees
+  for (const x of [18, 92, 196, 286]) {
+    rect(c, x + 6, 48, 8, 52, DUSK);
+    rect(c, x + 7, 48, 2, 52, SLATE);
+    rect(c, x - 8, 22, 36, 30, GREEN);
+    rect(c, x - 2, 12, 24, 14, GREEN);
+    for (let i = 0; i < 10; i++) px(c, x - 6 + Math.floor(r() * 32), 16 + Math.floor(r() * 32), LIME);
+  }
+  // grass floor
+  rect(c, 0, 96, IW, IH - 96, GREEN);
+  rect(c, 0, 96, IW, 2, LIME);
+  for (let i = 0; i < 160; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), LIME);
+  for (let i = 0; i < 24; i++) {
+    const fx = Math.floor(r() * IW), fy = 104 + Math.floor(r() * 68);
+    px(c, fx, fy, r() < 0.5 ? RED : SAND); px(c, fx, fy + 1, DUSK);
+  }
+  // path
+  for (let y = 96; y < IH; y += 4) {
+    const w = 30 + (y - 96);
+    rect(c, 160 - (w >> 1), y, w, 4, SAND);
+  }
+}
+
+function paintSpaceship(c) {
+  const r = RNG(99);
+  rect(c, 0, 0, IW, IH, DUSK);
+  // hull panels
+  for (let y = 0; y < 96; y += 24) rect(c, 0, y, IW, 1, NIGHT);
+  for (let x = 0; x < IW; x += 40) rect(c, x, 0, 1, 96, NIGHT);
+  for (let i = 0; i < 14; i++) px(c, 4 + Math.floor(r() * 300), 4 + Math.floor(r() * 88), SLATE);
+  // big viewport with stars
+  panel(c, 90, 8, 140, 56, NIGHT, SILVER);
+  frameRect(c, 91, 9, 138, 54, SLATE);
+  for (let i = 0; i < 40; i++) px(c, 94 + Math.floor(r() * 132), 12 + Math.floor(r() * 48), r() < 0.8 ? WHITE : ICE);
+  rect(c, 196, 40, 10, 10, RED); rect(c, 198, 42, 6, 6, ORANGE);   // a planet
+  // consoles
+  for (const x of [8, 244]) {
+    panel(c, x, 56, 68, 40, SLATE, NIGHT);
+    for (let i = 0; i < 12; i++) {
+      const cx2 = x + 6 + (i % 4) * 16, cy = 62 + Math.floor(i / 4) * 10;
+      rect(c, cx2, cy, 8, 4, [RED, LIME, SKY, SAND][Math.floor(r() * 4)]);
+    }
+    rect(c, x + 4, 88, 60, 4, TEAL);
+  }
+  // floor: grated deck
+  rect(c, 0, 96, IW, IH - 96, SLATE);
+  rect(c, 0, 96, IW, 2, SILVER);
+  for (let y = 100; y < IH; y += 8) rect(c, 0, y, IW, 1, DUSK);
+  for (let x = 0; x < IW; x += 16) rect(c, x, 98, 1, IH - 98, DUSK);
+  // glowing floor strip
+  rect(c, 0, 96, IW, 1, ICE);
+}
+
+function paintSchool(c) {
+  const r = RNG(5);
+  rect(c, 0, 0, IW, 96, SAND);
+  rect(c, 0, 90, IW, 6, ORANGE);
+  // chalkboard
+  panel(c, 60, 10, 130, 52, TEAL, DUSK);
+  frameRect(c, 61, 11, 128, 50, SAND);
+  drawText(c, "PIXEL PUPPETS", 70, 18, WHITE);
+  drawText(c, "2 + 2 = 4", 70, 30, WHITE);
+  drawText(c, "abc def g", 70, 42, ICE);
+  // clock
+  rect(c, 240, 14, 18, 18, WHITE); frameRect(c, 240, 14, 18, 18, NIGHT);
+  rect(c, 248, 18, 2, 6, NIGHT); rect(c, 250, 22, 4, 2, NIGHT);
+  // door
+  rect(c, 8, 30, 34, 66, DUSK); rect(c, 10, 32, 30, 62, ORANGE); px(c, 36, 62, SAND);
+  // alphabet strip
+  rect(c, 50, 70, 252, 12, WHITE); frameRect(c, 50, 70, 252, 12, SLATE);
+  drawText(c, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 56, 72, NAVY);
+  // wood floor
+  rect(c, 0, 96, IW, IH - 96, ORANGE);
+  rect(c, 0, 96, IW, 2, DUSK);
+  for (let y = 96; y < IH; y += 10) rect(c, 0, y, IW, 1, DUSK);
+  for (let i = 0; i < 30; i++) rect(c, Math.floor(r() * IW), 96 + Math.floor(r() * 80), 8, 1, SAND);
+  // desks near the back of the floor band
+  for (const x of [40, 230]) {
+    rect(c, x, 86, 50, 3, SAND);
+    rect(c, x, 89, 50, 3, DUSK);
+    rect(c, x + 2, 92, 3, 16, DUSK); rect(c, x + 45, 92, 3, 16, DUSK);
+    rect(c, x + 2, 106, 46, 2, DUSK);
+  }
+}
+
+const BACKDROPS = [
+  { id: "castle", name: "CASTLE", paint: paintCastle },
+  { id: "forest", name: "FOREST", paint: paintForest },
+  { id: "ship",   name: "SPACESHIP", paint: paintSpaceship },
+  { id: "school", name: "SCHOOL", paint: paintSchool }
+];
+for (const b of BACKDROPS) {
+  const [cv, cx] = makeCanvas(IW, IH);
+  b.paint(cx);
+  b.canvas = cv;
+}
+
+/* Stage bounds for puppet feet. */
+const STAGE_MINX = 10, STAGE_MAXX = IW - 10;
+const STAGE_MINY = 100, STAGE_MAXY = IH - 6;
+/* ============================================================================
+   PUPPET — runtime instance of a character on stage.
+
+   Character spec (what gets saved to JSON — ids and palette indices only):
+     { name: "BLUE KNIGHT",
+       slots:  { head:"round", hair:"none", hat:"helmet", face:"dot",
+                 torso:"armor", arms:"armor", legs:"armor", shoes:"boot",
+                 item:"sword" },
+       colors: { skin:4, hair:9, hat:13, torso:13, arms:13, legs:13,
+                 shoes:15, item:9 } }
+
+   Positions are integers in internal-resolution pixels. Physics keeps
+   sub-pixel motion in fx/fy/vx/vy floats; everything that draws, records or
+   hit-tests reads the floored .x/.y so nothing ever lands off-grid.
+   ==========================================================================*/
+
+let nextPuppetId = 1;
+
+const WALK_SEQ = [2, 1, 0, 1, 2, 3, 4, 3];   // ping-pong through the 5 pose frames
+const BOB_SEQ  = [0, 0, 1, 0];               // torso/head bob offsets during a stride
+
+function remapFor(spec, slot) {
+  const m = {};
+  m[SKINC] = spec.colors.skin;
+  if (spec.colors[slot] !== undefined) m[RECOLOR] = spec.colors[slot];
+  return m;
+}
+
+/* Resolve a spec into decoded sprites (cached by sprite()). */
+function buildParts(spec) {
+  const s = spec.slots, p = {};
+  p.head = sprite(optionById(HEAD_OPTIONS, s.head).rows, remapFor(spec, "head"));
+  const hair = optionById(HAIR_OPTIONS, s.hair);
+  p.hair = hair.rows ? { spr: sprite(hair.rows, remapFor(spec, "hair")), dy: hair.dy } : null;
+  const hat = optionById(HAT_OPTIONS, s.hat);
+  p.hat = hat.rows ? { spr: sprite(hat.rows, remapFor(spec, "hat")), dy: hat.dy } : null;
+  const face = optionById(FACE_OPTIONS, s.face);
+  p.faceOpen = sprite(face.open, remapFor(spec, "face"));
+  p.faceClosed = sprite(face.closed, remapFor(spec, "face"));
+  p.torso = sprite(optionById(TORSO_OPTIONS, s.torso).rows, remapFor(spec, "torso"));
+  const armOpt = optionById(ARM_OPTIONS, s.arms);
+  p.arms = armOpt.frames.map(f => ({ spr: sprite(f.rows, remapFor(spec, "arms")), ox: f.ox, oy: f.oy, end: f.end }));
+  const legOpt = optionById(LEG_OPTIONS, s.legs);
+  p.legs = legOpt.frames.map(f => ({ spr: sprite(f.rows, remapFor(spec, "legs")), ox: f.ox, oy: f.oy, end: f.end }));
+  p.shoe = sprite(optionById(SHOE_OPTIONS, s.shoes).rows, remapFor(spec, "shoes"));
+  const item = optionById(ITEM_OPTIONS, s.item);
+  p.item = item.rows ? { spr: sprite(item.rows, remapFor(spec, "item")), ax: item.ax, ay: item.ay } : null;
+  p.jaws = JAW_SPRITES.map(rows => sprite(rows, {}));
+  return p;
+}
+
+class Puppet {
+  constructor(spec, x, y, id) {
+    this.id = id !== undefined ? id : nextPuppetId++;
+    this.spec = JSON.parse(JSON.stringify(spec));
+    this.parts = buildParts(this.spec);
+    this.fx = x; this.fy = y;          // float physics position
+    this.vx = 0; this.vy = 0;
+    this.facing = 1;                    // 1 right, -1 left (mirrored art)
+    this.scheme = null;                 // "WASD" | "ARROWS" | "IJKL" | null
+    this.layerMode = "auto";            // "auto" (depth-sort by y) or "manual"
+    this.manualZ = 0;
+    this.walkPhase = 0;                 // advanced by distance travelled
+    this.walkIdx = 0;                   // current index into WALK_SEQ
+    this.moving = false;
+    this.settleT = 0;                   // timer for stepping back to neutral
+    this.breathT = Math.random() * 3000;
+    this.blinkT = 1500 + Math.random() * 3000;
+    this.blinkHold = 0;
+    this.jaw = 0;                       // 0 closed / 1 open / 2 wide
+    this.bbox = { x: 0, y: 0, w: 0, h: 0 };
+  }
+  get x() { return Math.floor(this.fx); }
+  get y() { return Math.floor(this.fy); }
+  setPos(x, y) { this.fx = x; this.fy = y; }
+
+  /* Advance idle/blink timers and walk cycle. dx = distance moved this step. */
+  animate(dt, dx) {
+    const speed = Math.abs(dx);
+    if (speed > 0.01) {
+      this.moving = true;
+      // Stride is tied to distance, not time: ~5px of travel per pose frame.
+      this.walkPhase += speed * 0.2;
+      this.walkIdx = Math.floor(this.walkPhase) % WALK_SEQ.length;
+    } else if (this.moving || WALK_SEQ[this.walkIdx] !== NEUTRAL_FRAME) {
+      // Step back through frames to the neutral pose instead of snapping.
+      this.moving = false;
+      this.settleT += dt;
+      if (this.settleT > 40) {
+        this.settleT = 0;
+        if (WALK_SEQ[this.walkIdx] !== NEUTRAL_FRAME) this.walkIdx = (this.walkIdx + 1) % WALK_SEQ.length;
+      }
+    }
+    this.breathT += dt;
+    this.blinkT -= dt;
+    if (this.blinkT <= 0) { this.blinkHold = 140; this.blinkT = 1800 + Math.random() * 3200; }
+    if (this.blinkHold > 0) this.blinkHold -= dt;
+  }
+
+  frames() {
+    const i = this.walkIdx;
+    const legR = WALK_SEQ[i];
+    const legL = WALK_SEQ[(i + 4) % WALK_SEQ.length];
+    return { legR, legL, armR: legL, armL: legR };   // arms swing opposite legs
+  }
+}
+
+/* Draw one puppet. opts: {clean:bool} hides badges. Returns nothing; updates
+   p.bbox (composed bounding box of everything drawn) for hit-testing.      */
+function drawPuppet(ctx, p, opts) {
+  const P = p.parts, f = p.frames(), x = p.x, y = p.y, fc = p.facing;
+  const bobIdx = p.moving ? BOB_SEQ[p.walkIdx % BOB_SEQ.length]
+                          : (Math.floor(p.breathT / 800) % 2);
+  const bob = bobIdx;   // 0 or 1 px down
+  let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+  const acc = (r) => {
+    if (!r) return;
+    bx0 = Math.min(bx0, r.x); by0 = Math.min(by0, r.y);
+    bx1 = Math.max(bx1, r.x + r.w); by1 = Math.max(by1, r.y + r.h);
+  };
+  const limb = (set, idx, pivot) => {
+    const fr = set[idx];
+    return { fr, draw: () => acc(blitPart(ctx, fr.spr, x, y, pivot.x + fr.ox, pivot.y + fr.oy, fc)) };
+  };
+  const armL = limb(P.arms, f.armL, RIG.shoulderL);
+  const armR = limb(P.arms, f.armR, RIG.shoulderR);
+  const legL = limb(P.legs, f.legL, RIG.hipL);
+  const legR = limb(P.legs, f.legR, RIG.hipR);
+
+  // z order: left arm, left leg+shoe, right leg+shoe, torso, head, jaw,
+  //          face, hair, hat, right arm, item
+  armL.draw();
+  legL.draw();
+  acc(blitPart(ctx, P.shoe, x, y, RIG.hipL.x + legL.fr.end[0] + RIG.shoeDx, RIG.hipL.y + legL.fr.end[1] + RIG.shoeDy, fc));
+  legR.draw();
+  acc(blitPart(ctx, P.shoe, x, y, RIG.hipR.x + legR.fr.end[0] + RIG.shoeDx, RIG.hipR.y + legR.fr.end[1] + RIG.shoeDy, fc));
+  acc(blitPart(ctx, P.torso, x, y, RIG.torso.ox, RIG.torso.oy, fc));
+  acc(blitPart(ctx, P.head, x, y, RIG.head.ox, RIG.head.oy + bob, fc));
+  acc(blitPart(ctx, P.jaws[p.jaw], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
+  const face = (p.blinkHold > 0) ? P.faceClosed : P.faceOpen;
+  acc(blitPart(ctx, face, x, y, RIG.faceDx, RIG.head.oy + RIG.faceDy + bob, fc));
+  if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, -6, RIG.head.oy + P.hair.dy + bob, fc));
+  if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, -6, RIG.head.oy + P.hat.dy + bob, fc));
+  armR.draw();
+  if (P.item) {
+    const hx = RIG.shoulderR.x + armR.fr.end[0], hy = RIG.shoulderR.y + armR.fr.end[1];
+    acc(blitPart(ctx, P.item.spr, x, y, hx - P.item.ax, hy - P.item.ay, fc));
+  }
+  p.bbox = { x: bx0, y: by0, w: bx1 - bx0, h: by1 - by0 };
+}
+
+/* Sort key for stage depth: puppets lower on screen draw in front, unless the
+   user manually re-layered them (manual wins over all autos in its direction). */
+function sortStage(puppets) {
+  return puppets.slice().sort((a, b) => {
+    const ka = a.layerMode === "manual" ? a.manualZ : a.y;
+    const kb = b.layerMode === "manual" ? b.manualZ : b.y;
+    return ka - kb || a.id - b.id;
+  });
+}
+/* ============================================================================
+   MICROPHONE + MOUTH
+   Mic audio runs through a WebAudio AnalyserNode; a running RMS amplitude is
+   quantized into the jaw's discrete states (0 closed / 1 open / 2 wide) with
+   smoothing, a noise floor, and a minimum hold time so the mouth doesn't
+   flicker. If mic access is denied everything still works: takes are silent
+   and a speaking puppet falls back to a simple timed flap.
+   ==========================================================================*/
+
+const mic = {
+  requested: false,
+  ok: false,
+  stream: null,       // raw mic MediaStream (also fed to MediaRecorder)
+  analyser: null,
+  buf: null,
+  amp: 0,             // smoothed RMS, 0..~1
+  ctx: null
+};
+
+function audioCtx() {
+  if (!mic.ctx) mic.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (mic.ctx.state === "suspended") mic.ctx.resume();
+  return mic.ctx;
+}
+
+function requestMic() {
+  if (mic.requested) return;
+  mic.requested = true;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    .then(stream => {
+      mic.stream = stream;
+      const ctx = audioCtx();
+      const src = ctx.createMediaStreamSource(stream);
+      mic.analyser = ctx.createAnalyser();
+      mic.analyser.fftSize = 512;
+      mic.buf = new Float32Array(mic.analyser.fftSize);
+      src.connect(mic.analyser);
+      mic.ok = true;
+    })
+    .catch(() => { mic.ok = false; });
+}
+
+function updateMicAmp() {
+  if (!mic.ok || !mic.analyser) { mic.amp = 0; return; }
+  mic.analyser.getFloatTimeDomainData(mic.buf);
+  let sum = 0;
+  for (let i = 0; i < mic.buf.length; i++) sum += mic.buf[i] * mic.buf[i];
+  const rms = Math.sqrt(sum / mic.buf.length);
+  mic.amp = mic.amp * 0.6 + rms * 0.4;   // smoothing
+}
+
+/* Quantizer shared by live performance, playback and export so the mouth
+   behaves identically in all three. */
+class MouthQuantizer {
+  constructor() { this.state = 0; this.pending = 0; this.hold = 0; }
+  reset() { this.state = 0; this.pending = 0; this.hold = 0; }
+  update(amp, dt) {
+    const NOISE_FLOOR = 0.025, WIDE = 0.085, MIN_HOLD = 80;
+    const target = amp < NOISE_FLOOR ? 0 : amp < WIDE ? 1 : 2;
+    this.hold += dt;
+    if (target !== this.state) {
+      if (target !== this.pending) { this.pending = target; }
+      if (this.hold >= MIN_HOLD) { this.state = target; this.hold = 0; }
+    } else {
+      this.pending = target;
+    }
+    return this.state;
+  }
+}
+const liveMouth = new MouthQuantizer();
+
+/* Fallback flap used when someone holds a talk key with no mic available. */
+function flapAmp(t) { return (Math.floor(t / 200) % 3 === 1) ? 0.12 : 0.05; }
+/* ============================================================================
+   INPUT — three keyboard control schemes usable simultaneously on one
+   keyboard, plus mouse handling. Key state lives in a held-keys set updated
+   on keydown/keyup and is read once per fixed timestep; puppets are never
+   moved inside event handlers (key repeat would stutter the motion).
+   ==========================================================================*/
+
+const SCHEMES = {
+  WASD:   { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", talk: "ShiftLeft",  label: "WASD" },
+  ARROWS: { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", talk: "ShiftRight", label: "ARWS" },
+  IJKL:   { left: "KeyJ", right: "KeyL", up: "KeyI", down: "KeyK", talk: "Slash",     label: "IJKL" }
+};
+const SCHEME_NAMES = ["WASD", "ARROWS", "IJKL"];
+
+const held = new Set();          // e.code of every currently-held key
+let talkStack = [];              // scheme names, in press order (last = active)
+let textInput = null;            // {get,set,max} — routes typing when focused
+
+const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash", "Space"]);
+
+window.addEventListener("keydown", (e) => {
+  if (textInput) {                       // builder name field has focus
+    if (e.key === "Enter" || e.key === "Escape") textInput = null;
+    else if (e.key === "Backspace") textInput.set(textInput.get().slice(0, -1));
+    else if (e.key.length === 1 && (e.key in FONT) && textInput.get().length < textInput.max)
+      textInput.set(textInput.get() + e.key);
+    e.preventDefault();
+    return;
+  }
+  if (PREVENT.has(e.code)) e.preventDefault();
+  if (!e.repeat) {
+    held.add(e.code);
+    for (const name of SCHEME_NAMES)
+      if (SCHEMES[name].talk === e.code) {
+        talkStack = talkStack.filter(n => n !== name);
+        talkStack.push(name);            // most recently pressed wins
+      }
+    onKeyPressed(e.code);                // one-shot actions (help, delete...)
+  }
+});
+window.addEventListener("keyup", (e) => {
+  held.delete(e.code);
+  for (const name of SCHEME_NAMES)
+    if (SCHEMES[name].talk === e.code) talkStack = talkStack.filter(n => n !== name);
+});
+window.addEventListener("blur", () => { held.clear(); talkStack = []; });
+
+/* Velocity-based movement, run once per fixed timestep from update().
+   Horizontal keys accelerate toward a modest top speed; releasing
+   decelerates to a stop so the walk cycle reads naturally. Vertical keys
+   walk the puppet toward/away from the viewer (no scaling with depth). */
+function driveScheme(p, sc) {
+  const ACCX = 0.14, TOPX = 1.3, ACCY = 0.10, TOPY = 0.8, FRICTION = 0.82;
+  let ix = 0, iy = 0;
+  if (held.has(sc.left)) ix -= 1;
+  if (held.has(sc.right)) ix += 1;
+  if (held.has(sc.up)) iy -= 1;
+  if (held.has(sc.down)) iy += 1;
+  p.vx = ix ? clamp(p.vx + ix * ACCX, -TOPX, TOPX) : p.vx * FRICTION;
+  p.vy = iy ? clamp(p.vy + iy * ACCY, -TOPY, TOPY) : p.vy * FRICTION;
+  if (Math.abs(p.vx) < 0.02) p.vx = 0;
+  if (Math.abs(p.vy) < 0.02) p.vy = 0;
+  if (ix > 0) p.facing = 1; else if (ix < 0) p.facing = -1;
+  p.fx = clamp(p.fx + p.vx, STAGE_MINX, STAGE_MAXX);
+  p.fy = clamp(p.fy + p.vy, STAGE_MINY, STAGE_MAXY);
+}
+
+/* Assigning a scheme releases it from whoever had it. */
+function assignScheme(puppets, p, name) {
+  for (const q of puppets) if (q.scheme === name) q.scheme = null;
+  p.scheme = name;
+}
+
+/* ---- Mouse --------------------------------------------------------------
+   Screen position -> internal pixels: divide by the integer scale, floor. */
+function toInternal(e) {
+  const r = display.getBoundingClientRect();
+  return { x: Math.floor((e.clientX - r.left) / SCALE), y: Math.floor((e.clientY - r.top) / SCALE) };
+}
+
+const mouse = { x: 0, y: 0, down: false };
+let uiButtons = [];      // rebuilt every rendered frame by the UI pass
+let dragging = null;     // {p, dx, dy} while a puppet is dragged
+let scrubbing = false;   // dragging the transport scrub bar
+
+function uiBtn(x, y, w, h, cb) { uiButtons.push({ x, y, w, h, cb }); }
+function hitUI(x, y) {
+  for (let i = uiButtons.length - 1; i >= 0; i--) {
+    const b = uiButtons[i];
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) { b.cb(x, y); return true; }
+  }
+  return false;
+}
+
+display.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  const m = toInternal(e);
+  mouse.x = m.x; mouse.y = m.y; mouse.down = true;
+  requestMic();          // first user gesture: try to get the mic ready
+  audioCtx();
+  onMouseDown(m.x, m.y);
+});
+window.addEventListener("mousemove", (e) => {
+  const m = toInternal(e);
+  mouse.x = m.x; mouse.y = m.y;
+  onMouseMove(m.x, m.y);
+});
+window.addEventListener("mouseup", () => { mouse.down = false; onMouseUp(); });
+display.addEventListener("contextmenu", (e) => e.preventDefault());
+/* ============================================================================
+   PERFORMANCE CAPTURE — recording a show captures DATA, not pixels.
+
+   TIMELINE EVENT SCHEMA — each event: {t, type, ...} with t in ms relative
+   to the start of the take. Types:
+     spawn    {id, spec, x, y, facing}   puppet added (full character spec is
+                                         embedded so takes survive roster edits)
+     remove   {id}                       puppet removed
+     pos      {id, x, y}                 integer position keyframe (sampled on
+                                         change, not every frame — sparse)
+     layer    {id, mode, z}              layer-order change ("auto"/"manual")
+     backdrop {index}                    scene swap
+     speaker  {id}                       active-speaker change (-1 = nobody)
+   Keyboard motion is recorded exactly like dragging — as resulting position
+   keyframes — so playback never replays input.
+
+   AMPLITUDE TRACK — take.amps is [[t, amp], ...] sampled ~30Hz while
+   recording; playback/export feed it through the same MouthQuantizer.
+
+   NARRATOR AUDIO — captured separately by a MediaRecorder on the raw mic
+   stream, kept in memory as a Blob. A take with no mic is simply silent.
+
+   To add a new event type: emit it in recEvent(), apply it in applyEvent().
+   ==========================================================================*/
+
+let recording = null;   // {t0, events, amps, lastPos:Map, mediaRec, chunks}
+let take = null;        // {duration, events, amps, audioBlob, audioURL, keyframes:Map}
+
+function recNow() { return Math.round(performance.now() - recording.t0); }
+function recEvent(ev) { ev.t = recNow(); recording.events.push(ev); }
+
+function startRecording() {
+  recording = { t0: performance.now(), events: [], amps: [], lastPos: new Map(), mediaRec: null, chunks: [] };
+  // Snapshot initial state at t=0 so playback can reconstruct the stage.
+  recording.events.push({ t: 0, type: "backdrop", index: live.backdrop });
+  for (const p of live.puppets) {
+    recording.events.push({ t: 0, type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
+    if (p.layerMode === "manual")
+      recording.events.push({ t: 0, type: "layer", id: p.id, mode: "manual", z: p.manualZ });
+    recording.lastPos.set(p.id, { x: p.x, y: p.y, t: 0 });
+  }
+  recording.events.push({ t: 0, type: "speaker", id: -1 });
+  recording.lastSpeaker = -1;
+  recording.lastAmp = -1;
+  if (mic.ok && mic.stream && window.MediaRecorder) {
+    try {
+      const rec = recording;   // handler closes over the take, not the global
+      rec.mediaRec = new MediaRecorder(mic.stream);
+      rec.mediaRec.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
+      rec.mediaRec.start();
+    } catch (err) { recording.mediaRec = null; }
+  }
+}
+
+/* Called every fixed step while recording. */
+function recordSample(speakerId, amp) {
+  const t = recNow();
+  for (const p of live.puppets) {
+    const last = recording.lastPos.get(p.id);
+    if (!last || ((last.x !== p.x || last.y !== p.y) && t - last.t >= 33)) {
+      recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
+      recording.lastPos.set(p.id, { x: p.x, y: p.y, t });
+    }
+  }
+  if (speakerId !== recording.lastSpeaker) {
+    recEvent({ type: "speaker", id: speakerId });
+    recording.lastSpeaker = speakerId;
+  }
+  const q = Math.round(amp * 1000) / 1000;
+  if (recording.amps.length === 0 || t - recording.amps[recording.amps.length - 1][0] >= 33) {
+    recording.amps.push([t, q]);
+  }
+}
+
+function stopRecording() {
+  const rec = recording;
+  const duration = recNow();
+  // final position keyframe for every puppet so playback ends in place
+  for (const p of live.puppets) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
+  const finalize = (audioBlob) => {
+    if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
+    take = {
+      duration: Math.max(duration, 100),
+      events: rec.events,
+      amps: rec.amps,
+      audioBlob,
+      audioURL: audioBlob ? URL.createObjectURL(audioBlob) : null,
+      keyframes: buildKeyframes(rec.events)
+    };
+  };
+  if (rec.mediaRec && rec.mediaRec.state !== "inactive") {
+    rec.mediaRec.onstop = () => finalize(new Blob(rec.chunks, { type: rec.mediaRec.mimeType || "audio/webm" }));
+    rec.mediaRec.stop();
+  } else {
+    finalize(null);
+  }
+  recording = null;
+}
+
+/* Index pos events per puppet id for fast interpolation during playback. */
+function buildKeyframes(events) {
+  const map = new Map();
+  for (const ev of events) {
+    if (ev.type === "spawn") {
+      if (!map.has(ev.id)) map.set(ev.id, []);
+      map.get(ev.id).push({ t: ev.t, x: ev.x, y: ev.y });
+    } else if (ev.type === "pos") {
+      if (!map.has(ev.id)) map.set(ev.id, []);
+      map.get(ev.id).push({ t: ev.t, x: ev.x, y: ev.y });
+    }
+  }
+  return map;
+}
+
+function discardTake() {
+  if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
+  take = null;
+}
+/* ============================================================================
+   PLAYBACK — replays a take by driving the same renderer from the timeline
+   instead of live input. If the take has narrator audio, the <audio> element
+   is the clock source so picture and sound stay locked; otherwise a simple
+   accumulator clock is used. Walk cycles are regenerated from interpolated
+   position deltas exactly as they are live — animation is never stored.
+   ==========================================================================*/
+
+const play = {
+  active: false,
+  exporting: false,
+  t: 0,
+  playing: false,
+  puppets: [],          // separate instances; the live stage is untouched
+  backdrop: 0,
+  speakerId: -1,
+  eventIdx: 0,
+  ampIdx: 0,
+  audio: null,          // <audio> clock when the take has narration
+  mouth: new MouthQuantizer(),
+  ended: false
+};
+
+/* The narration <audio> is the clock while it has data; if the audio track is
+   shorter than the timeline (or absent) the accumulator clock takes over so
+   playback always reaches the end of the take. */
+function playbackClock() {
+  if (play.audio && !play.audio.ended && !isNaN(play.audio.currentTime)) return play.audio.currentTime * 1000;
+  return play.t;
+}
+
+function enterPlayback() {
+  if (!take) return;
+  mode = "playback";
+  play.active = true;
+  play.exporting = false;
+  if (take.audioURL) {
+    play.audio = new Audio(take.audioURL);
+  } else play.audio = null;
+  seekPlayback(0);
+  resumePlayback();
+}
+
+function resumePlayback() {
+  if (play.ended || playbackClock() >= take.duration - 1) seekPlayback(0);
+  play.playing = true;
+  play.ended = false;
+  if (play.audio) play.audio.play().catch(() => { play.audio = null; });
+}
+function pausePlayback() {
+  play.playing = false;
+  if (play.audio) play.audio.pause();
+}
+function exitPlayback() {
+  pausePlayback();
+  play.active = false;
+  play.puppets = [];
+  play.audio = null;
+  mode = "stage";
+}
+
+/* Rebuild playback state at time t by re-applying events from the start.
+   Event counts are small (sparse sampling), so a scrub re-scan is cheap. */
+function seekPlayback(t) {
+  t = clamp(t, 0, take.duration);
+  play.puppets = [];
+  play.backdrop = live.backdrop;
+  play.speakerId = -1;
+  play.eventIdx = 0;
+  play.ampIdx = 0;
+  play.mouth.reset();
+  play.t = t;
+  play.ended = false;
+  while (play.eventIdx < take.events.length && take.events[play.eventIdx].t <= t)
+    applyEvent(take.events[play.eventIdx++]);
+  updatePlaybackPositions(t, 0);
+  if (play.audio) { try { play.audio.currentTime = t / 1000; } catch (e) {} }
+}
+
+function findPlayPuppet(id) {
+  for (const p of play.puppets) if (p.id === id) return p;
+  return null;
+}
+
+function applyEvent(ev) {
+  switch (ev.type) {
+    case "spawn": {
+      const p = new Puppet(ev.spec, ev.x, ev.y, ev.id);
+      p.facing = ev.facing || 1;
+      play.puppets.push(p);
+      break;
+    }
+    case "remove": {
+      play.puppets = play.puppets.filter(p => p.id !== ev.id);
+      break;
+    }
+    case "pos": break;   // handled by keyframe interpolation
+    case "layer": {
+      const p = findPlayPuppet(ev.id);
+      if (p) { p.layerMode = ev.mode; p.manualZ = ev.z || 0; }
+      break;
+    }
+    case "backdrop": play.backdrop = ev.index; break;
+    case "speaker": play.speakerId = ev.id; break;
+  }
+}
+
+/* Interpolate between position keyframes, floor to integers at assignment,
+   and feed the deltas into the same walk-cycle logic used live. */
+function updatePlaybackPositions(t, dt) {
+  for (const p of play.puppets) {
+    const kf = take.keyframes.get(p.id);
+    if (!kf || !kf.length) continue;
+    let a = kf[0], b = kf[kf.length - 1];
+    for (let i = 0; i < kf.length; i++) {
+      if (kf[i].t <= t) a = kf[i];
+      if (kf[i].t >= t) { b = kf[i]; break; }
+    }
+    const span = b.t - a.t;
+    const f = span > 0 ? clamp((t - a.t) / span, 0, 1) : 0;
+    const nx = lerp(a.x, b.x, f), ny = lerp(a.y, b.y, f);
+    const dx = nx - p.fx;
+    if (dx > 0.05) p.facing = 1; else if (dx < -0.05) p.facing = -1;
+    p.setPos(nx, ny);
+    p.animate(dt, dx);
+  }
+}
+
+function currentAmp(t) {
+  const amps = take.amps;
+  if (!amps.length) return 0;
+  while (play.ampIdx < amps.length - 1 && amps[play.ampIdx + 1][0] <= t) play.ampIdx++;
+  while (play.ampIdx > 0 && amps[play.ampIdx][0] > t) play.ampIdx--;
+  return amps[play.ampIdx][1];
+}
+
+/* Advance playback by one fixed step. Shared by playback mode and export. */
+function stepPlayback(dt) {
+  if (!play.playing) return;
+  if (!play.audio || play.audio.ended) play.t += dt;
+  else play.t = play.audio.currentTime * 1000;   // stay synced for takeover
+  const t = playbackClock();
+  while (play.eventIdx < take.events.length && take.events[play.eventIdx].t <= t)
+    applyEvent(take.events[play.eventIdx++]);
+  updatePlaybackPositions(t, dt);
+  const amp = currentAmp(t);
+  const jaw = play.mouth.update(amp, dt);
+  for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
+  if (t >= take.duration) {
+    play.playing = false;
+    play.ended = true;
+    if (play.audio) play.audio.pause();
+    if (play.exporting) finishExport();
+  }
+}
+/* ============================================================================
+   VIDEO EXPORT — plays the timeline from the start (never re-performing the
+   show) while capturing an export canvas sized to an exact integer multiple
+   of 320x180 (4x = 1280x720, so the file contains no resampling). Video
+   comes from canvas.captureStream(30); recorded narrator audio is routed
+   through a MediaStreamAudioDestinationNode and mixed in. Selection
+   outlines, controller badges and UI overlays are all hidden.
+   ==========================================================================*/
+
+const EXPORT_SCALE = 4;
+let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType}
+
+function startExport() {
+  if (!take || exporter) return;
+  const [cv, cx] = makeCanvas(IW * EXPORT_SCALE, IH * EXPORT_SCALE);
+  let mimeType = "";
+  if (window.MediaRecorder) {
+    if (MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")) mimeType = "video/webm;codecs=vp9,opus";
+    else if (MediaRecorder.isTypeSupported("video/webm")) mimeType = "video/webm";
+  } else {
+    return; // no MediaRecorder: export unavailable
+  }
+  const stream = cv.captureStream(30);
+  let audioEl = null;
+  if (take.audioURL) {
+    // Fresh element each export: a MediaElementSource permanently claims its
+    // element. Routed ONLY to the destination node, so exporting is silent.
+    audioEl = new Audio(take.audioURL);
+    const ctx = audioCtx();
+    const src = ctx.createMediaElementSource(audioEl);
+    const dest = ctx.createMediaStreamDestination();
+    src.connect(dest);
+    for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
+  }
+  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType };
+  exporter = ex;
+  recorder.ondataavailable = (e) => { if (e.data.size) ex.chunks.push(e.data); };
+  recorder.onstop = () => deliverExport(ex);
+
+  // Drive the shared playback machinery with the export flag set.
+  mode = "export";
+  play.active = true;
+  play.exporting = true;
+  play.audio = audioEl;
+  seekPlayback(0);
+  play.playing = true;
+  play.ended = false;
+  if (audioEl) audioEl.play().catch(() => { play.audio = null; });
+  recorder.start(250);
+}
+
+/* Blit the clean 320x180 frame up to the export canvas (integer 4x). */
+function captureExportFrame() {
+  if (!exporter) return;
+  exporter.ctx.drawImage(screen, 0, 0, IW * EXPORT_SCALE, IH * EXPORT_SCALE);
+}
+
+function finishExport() {
+  if (!exporter) return;
+  if (exporter.recorder.state !== "inactive") exporter.recorder.stop();
+}
+
+function cancelExport() {
+  if (!exporter) return;
+  exporter.canceled = true;
+  if (exporter.recorder.state !== "inactive") exporter.recorder.stop();
+}
+
+function deliverExport(ex) {
+  if (exporter === ex) exporter = null;
+  play.active = false;
+  play.exporting = false;
+  play.puppets = [];
+  play.audio = null;
+  mode = "stage";
+  if (!ex || ex.canceled || !ex.chunks.length) return;
+  const blob = new Blob(ex.chunks, { type: ex.mimeType || "video/webm" });
+  const url = URL.createObjectURL(blob);
+  // download puppet-show.webm
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "puppet-show.webm";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // inline review player
+  const overlay = document.getElementById("reviewOverlay");
+  const video = document.getElementById("reviewVideo");
+  video.src = url;
+  overlay.classList.add("open");
+  const closeBtn = document.getElementById("closeReviewBtn");
+  const saveBtn = document.getElementById("saveAgainBtn");
+  closeBtn.replaceChildren(makeTextCanvas("CLOSE", WHITE, 2));
+  saveBtn.replaceChildren(makeTextCanvas("SAVE FILE", WHITE, 2));
+  closeBtn.onclick = () => { overlay.classList.remove("open"); video.pause(); };
+  saveBtn.onclick = () => {
+    const a2 = document.createElement("a");
+    a2.href = url; a2.download = "puppet-show.webm";
+    document.body.appendChild(a2); a2.click(); a2.remove();
+  };
+}
+/* ============================================================================
+   ROSTER + PERSISTENCE — characters are saved as JSON only: slot ids and
+   palette index mappings, never image data. Auto-saves to localStorage when
+   available; falls back cleanly to in-memory only. Explicit Export/Import
+   buttons download/read back a .json file.
+   ==========================================================================*/
+
+function makeSpec(name, slots, colors) {
+  return {
+    name,
+    slots: Object.assign({ head: "round", hair: "none", hat: "none", face: "dot",
+                           torso: "tee", arms: "short", legs: "pants", shoes: "sneaker",
+                           item: "none" }, slots),
+    colors: Object.assign({ skin: SAND, hair: DUSK, hat: BLUE, torso: BLUE,
+                            arms: BLUE, legs: NAVY, shoes: DUSK, item: BLUE }, colors)
+  };
+}
+
+/* Four pre-built characters. */
+function prebuiltRoster() {
+  return [
+    makeSpec("SIR BLOO", { hat: "helmet", torso: "armor", arms: "armor", legs: "armor", shoes: "boot", item: "sword", face: "dot" },
+             { hat: SILVER, torso: SKY, arms: SKY, legs: SLATE, shoes: DUSK, item: BLUE }),
+    makeSpec("MERLA", { hat: "wizard", hair: "long", torso: "dress", arms: "robe", legs: "pants", shoes: "boot", item: "wand", face: "big", head: "egg" },
+             { hat: PLUM, hair: WHITE, torso: PLUM, arms: PLUM, legs: DUSK, shoes: DUSK, item: BLUE, skin: SAND }),
+    makeSpec("ZIP-7", { hat: "helmet", torso: "armor", arms: "long", legs: "armor", shoes: "boot", item: "flag", face: "shades", head: "square" },
+             { hat: WHITE, torso: WHITE, arms: WHITE, legs: WHITE, shoes: RED, item: GREEN, skin: ORANGE }),
+    makeSpec("PENNY", { hat: "cap", hair: "pony", torso: "overalls", arms: "short", legs: "shorts", shoes: "sneaker", item: "book", face: "freckle", head: "round" },
+             { hat: RED, hair: ORANGE, torso: SKY, arms: SAND, legs: NAVY, shoes: WHITE, item: GREEN })
+  ];
+}
+
+let roster = [];
+const STORE_KEY = "pixelPuppetsRoster.v1";
+
+function storageAvailable() {
+  try {
+    const t = "__pp_test__";
+    window.localStorage.setItem(t, t);
+    window.localStorage.removeItem(t);
+    return true;
+  } catch (e) { return false; }
+}
+const canStore = storageAvailable();
+
+function saveRoster() {
+  if (!canStore) return;
+  try { window.localStorage.setItem(STORE_KEY, JSON.stringify({ version: 1, characters: roster })); }
+  catch (e) { /* quota or privacy mode: stay in-memory */ }
+}
+function loadRoster() {
+  if (canStore) {
+    try {
+      const raw = window.localStorage.getItem(STORE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && Array.isArray(data.characters) && data.characters.length) {
+          roster = data.characters.map(c => makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {}));
+          return;
+        }
+      }
+    } catch (e) { /* corrupted store: fall through to defaults */ }
+  }
+  roster = prebuiltRoster();
+  saveRoster();
+}
+
+function exportRosterFile() {
+  const blob = new Blob([JSON.stringify({ version: 1, characters: roster }, null, 2)],
+                       { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "pixel-puppets-roster.json";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function importRosterFile() {
+  const input = document.getElementById("importFile");
+  input.onchange = () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        const chars = Array.isArray(data) ? data : data.characters;
+        if (Array.isArray(chars) && chars.length) {
+          roster = chars.map(c => makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {}));
+          saveRoster();
+          toast("ROSTER IMPORTED: " + roster.length + " PUPPETS");
+        } else toast("NOT A ROSTER FILE");
+      } catch (e) { toast("COULD NOT READ FILE"); }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+/* ============================================================================
+   CHARACTER BUILDER — assemble a character from costume slots. Every option
+   is recolored by remapping palette indices (see remapFor); the preview is a
+   real Puppet walking in place with the mouth cycling, so what you see is
+   exactly what performs.
+   ==========================================================================*/
+
+const builder = {
+  spec: null,          // spec being edited
+  preview: null,       // Puppet instance for the live preview
+  editIndex: -1,       // roster index being edited, -1 = new character
+  jawT: 0,
+  dirty: false
+};
+
+function rebuildPreview() {
+  const b = builder;
+  b.preview = new Puppet(b.spec, 0, 0, 0);
+  b.preview.facing = 1;
+}
+
+function enterBuilder(rosterIndex) {
+  mode = "builder";
+  builder.editIndex = rosterIndex;
+  builder.spec = rosterIndex >= 0
+    ? JSON.parse(JSON.stringify(roster[rosterIndex]))
+    : makeSpec("PUPPET " + (roster.length + 1), {}, {});
+  builder.dirty = false;
+  rebuildPreview();
+}
+
+function exitBuilder() { textInput = null; mode = "stage"; }
+
+function builderSave() {
+  const b = builder;
+  if (!b.spec.name.trim()) b.spec.name = "PUPPET";
+  if (b.editIndex >= 0) roster[b.editIndex] = JSON.parse(JSON.stringify(b.spec));
+  else { roster.push(JSON.parse(JSON.stringify(b.spec))); b.editIndex = roster.length - 1; }
+  saveRoster();
+  toast("SAVED " + b.spec.name);
+  b.dirty = false;
+}
+
+function builderDelete() {
+  if (builder.editIndex >= 0) {
+    roster.splice(builder.editIndex, 1);
+    saveRoster();
+    toast("DELETED");
+  }
+  exitBuilder();
+}
+
+function cycleOption(slotDef, dir) {
+  const cur = builder.spec.slots[slotDef.slot];
+  let i = slotDef.options.findIndex(o => o.id === cur);
+  i = (i + dir + slotDef.options.length) % slotDef.options.length;
+  builder.spec.slots[slotDef.slot] = slotDef.options[i].id;
+  builder.dirty = true;
+  rebuildPreview();
+}
+function cycleColor(key, dir) {
+  builder.spec.colors[key] = ((builder.spec.colors[key] || 0) + dir + 16) % 16;
+  builder.dirty = true;
+  rebuildPreview();
+}
+
+/* Builder screen renderer + UI registration (immediate mode). */
+function renderBuilder(ctx, dt) {
+  const b = builder;
+  rect(ctx, 0, 0, IW, IH, NAVY);
+  rect(ctx, 0, 0, IW, 14, NIGHT);
+  drawTextC(ctx, "CHARACTER BUILDER", IW / 2, 0, WHITE, 2);
+
+  // ---- live preview ----
+  panel(ctx, 10, 22, 92, 104, DUSK, SILVER);
+  rect(ctx, 11, 104, 90, 21, SLATE);   // floor band
+  const pv = b.preview;
+  pv.setPos(56, 112);
+  // walk in place + demo mouth
+  pv.walkPhase += 0.12;
+  pv.walkIdx = Math.floor(pv.walkPhase) % WALK_SEQ.length;
+  pv.moving = true;
+  pv.breathT += dt; pv.blinkT -= dt;
+  if (pv.blinkT <= 0) { pv.blinkHold = 140; pv.blinkT = 2200; }
+  if (pv.blinkHold > 0) pv.blinkHold -= dt;
+  b.jawT += dt;
+  pv.jaw = [0, 1, 2, 1][Math.floor(b.jawT / 260) % 4];
+  drawPuppet(ctx, pv, { clean: true });
+
+  // name box (canvas text input, still bitmap font)
+  const nameFocused = textInput && textInput.tag === "name";
+  panel(ctx, 10, 132, 92, 13, nameFocused ? SLATE : DUSK, nameFocused ? ICE : SILVER);
+  drawText(ctx, b.spec.name + (nameFocused && (Math.floor(performance.now() / 400) % 2) ? "_" : ""), 14, 135, WHITE);
+  uiBtn(10, 132, 92, 13, () => {
+    textInput = { tag: "name", max: 12, get: () => builder.spec.name, set: (v) => { builder.spec.name = v; builder.dirty = true; } };
+  });
+
+  // ---- slot rows ----
+  let y = 22;
+  for (const sd of SLOT_DEFS) {
+    drawText(ctx, sd.label, 110, y + 2, SILVER);
+    // option cycler
+    const cur = optionById(sd.options, b.spec.slots[sd.slot]);
+    panel(ctx, 148, y, 9, 11, NAVY, SILVER); drawText(ctx, "<", 151, y + 2, WHITE);
+    uiBtn(148, y, 9, 11, () => cycleOption(sd, -1));
+    rect(ctx, 158, y, 74, 11, DUSK);
+    drawTextC(ctx, cur.name, 195, y + 2, WHITE);
+    panel(ctx, 233, y, 9, 11, NAVY, SILVER); drawText(ctx, ">", 236, y + 2, WHITE);
+    uiBtn(233, y, 9, 11, () => cycleOption(sd, 1));
+    // color cycler
+    if (sd.colorable) {
+      panel(ctx, 248, y, 9, 11, NAVY, SILVER); drawText(ctx, "<", 251, y + 2, WHITE);
+      uiBtn(248, y, 9, 11, () => cycleColor(sd.slot, -1));
+      rect(ctx, 259, y + 1, 12, 9, b.spec.colors[sd.slot]);
+      frameRect(ctx, 259, y + 1, 12, 9, NIGHT);
+      panel(ctx, 273, y, 9, 11, NAVY, SILVER); drawText(ctx, ">", 276, y + 2, WHITE);
+      uiBtn(273, y, 9, 11, () => cycleColor(sd.slot, 1));
+    }
+    y += 13;
+  }
+  // skin color row
+  drawText(ctx, "SKIN", 110, y + 2, SILVER);
+  panel(ctx, 248, y, 9, 11, NAVY, SILVER); drawText(ctx, "<", 251, y + 2, WHITE);
+  uiBtn(248, y, 9, 11, () => cycleColor("skin", -1));
+  rect(ctx, 259, y + 1, 12, 9, b.spec.colors.skin);
+  frameRect(ctx, 259, y + 1, 12, 9, NIGHT);
+  panel(ctx, 273, y, 9, 11, NAVY, SILVER); drawText(ctx, ">", 276, y + 2, WHITE);
+  uiBtn(273, y, 9, 11, () => cycleColor("skin", 1));
+
+  // ---- bottom buttons ----
+  const buttons = [
+    ["SAVE", () => { builderSave(); }],
+    ["SAVE AS NEW", () => { builder.editIndex = -1; builderSave(); }],
+    ["DELETE", () => builderDelete()],
+    ["EXPORT JSON", () => exportRosterFile()],
+    ["IMPORT", () => importRosterFile()],
+    ["BACK", () => exitBuilder()]
+  ];
+  let bx = 10;
+  for (const [label, cb] of buttons) {
+    const w = textW(label) + 8;
+    panel(ctx, bx, 160, w, 13, NIGHT, SILVER);
+    drawText(ctx, label, bx + 4, 163, WHITE);
+    uiBtn(bx, 160, w, 13, cb);
+    bx += w + 5;
+  }
+  drawText(ctx, canStore ? "AUTO-SAVE ON" : "NO BROWSER STORAGE - USE EXPORT", 110, 150, SILVER);
+}
+/* ============================================================================
+   STAGE — live scene rendering, drawer, selection UI, transport, overlays.
+   ==========================================================================*/
+
+const live = { puppets: [], backdrop: 0 };
+let selected = null;
+let drawerOpen = true;
+let helpOpen = false;
+let zTopCounter = 1000, zBackCounter = -1000;
+let toastMsg = null, toastT = 0;
+function toast(msg) { toastMsg = msg; toastT = 2200; }
+
+function spawnPuppet(spec, x, y) {
+  const p = new Puppet(spec, x !== undefined ? x : 80 + Math.floor(Math.random() * 160),
+                             y !== undefined ? y : 120 + Math.floor(Math.random() * 40));
+  live.puppets.push(p);
+  if (recording) recEvent({ type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
+  return p;
+}
+function removePuppet(p) {
+  live.puppets = live.puppets.filter(q => q !== p);
+  if (selected === p) selected = null;
+  if (dragging && dragging.p === p) dragging = null;
+  if (recording) recEvent({ type: "remove", id: p.id });
+}
+function setBackdrop(i) {
+  live.backdrop = i;
+  if (recording) recEvent({ type: "backdrop", index: i });
+}
+function setLayer(p, mode2, z) {
+  p.layerMode = mode2; p.manualZ = z || 0;
+  if (recording) recEvent({ type: "layer", id: p.id, mode: mode2, z: p.manualZ });
+}
+
+/* Resolve who is speaking right now (live): held talk modifier of an assigned
+   scheme wins (most recent press first); otherwise a dragged puppet; else nobody. */
+function currentSpeaker() {
+  for (let i = talkStack.length - 1; i >= 0; i--) {
+    const name = talkStack[i];
+    for (const p of live.puppets) if (p.scheme === name) return p;
+  }
+  if (dragging) return dragging.p;
+  return null;
+}
+
+/* ---- Scene rendering (shared by live, playback and export) -------------- */
+function renderScene(ctx, state, opts) {
+  ctx.drawImage(BACKDROPS[state.backdrop].canvas, 0, 0);
+  const sorted = sortStage(state.puppets);
+  for (const p of sorted) drawPuppet(ctx, p, opts);
+  if (!opts.clean) {
+    for (const p of sorted) {
+      if (p.scheme) {   // controller badge, hidden during playback/export
+        const label = SCHEMES[p.scheme].label;
+        const w = textW(label) + 4;
+        const bx = p.x - (w >> 1), by = p.bbox.y - 10;
+        rect(ctx, bx, by, w, 9, NIGHT);
+        drawText(ctx, label, bx + 2, by + 1, ICE);
+      }
+    }
+    if (selected && live.puppets.includes(selected)) {
+      const b = selected.bbox;
+      dashRect(ctx, b.x - 1, b.y - 1, b.w + 2, b.h + 2, ICE, Math.floor(performance.now() / 120) & 7);
+    }
+  }
+}
+
+/* ---- Drawer ------------------------------------------------------------- */
+const DRAWER_H = 44;
+function renderDrawer(ctx) {
+  const y0 = IH - DRAWER_H;
+  if (!drawerOpen) {
+    panel(ctx, IW - 46, IH - 10, 46, 10, NIGHT, SILVER);
+    drawText(ctx, "ROSTER", IW - 42, IH - 8, WHITE);
+    uiBtn(IW - 46, IH - 10, 46, 10, () => { drawerOpen = true; });
+    return;
+  }
+  panel(ctx, 0, y0, IW, DRAWER_H, NIGHT, SILVER);
+  drawText(ctx, "ROSTER - CLICK TO ADD", 4, y0 + 2, SILVER);
+  panel(ctx, IW - 34, y0, 34, 10, DUSK, SILVER);
+  drawText(ctx, "HIDE", IW - 28, y0 + 2, WHITE);
+  uiBtn(IW - 34, y0, 34, 10, () => { drawerOpen = false; });
+
+  // roster cells: a mini live portrait of each character
+  let x = 4;
+  const cy = y0 + 11;
+  for (let i = 0; i < roster.length && x < IW - 110; i++) {
+    const spec = roster[i];
+    panel(ctx, x, cy, 26, 24, DUSK, SLATE);
+    const mini = miniPortrait(spec);
+    ctx.drawImage(mini, x + 1, cy + 1);
+    uiBtn(x, cy, 26, 24, ((idx) => () => {
+      const p = spawnPuppet(roster[idx]);
+      selected = p;
+      toast("ADDED " + roster[idx].name);
+    })(i));
+    if (!recording) {   // no costume edits mid-take
+      panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
+      drawTextC(ctx, "EDIT", x + 13, cy + 26, WHITE);
+      uiBtn(x, cy + 25, 26, 8, ((idx) => () => enterBuilder(idx))(i));
+    }
+    x += 28;
+  }
+  // new character cell
+  if (!recording) {
+    panel(ctx, x, cy, 26, 24, DUSK, SLATE);
+    drawTextC(ctx, "+", x + 13, cy + 8, LIME);
+    uiBtn(x, cy, 26, 33, () => enterBuilder(-1));
+    panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
+    drawTextC(ctx, "NEW", x + 13, cy + 26, WHITE);
+  }
+
+  // backdrop thumbnails (nearest-neighbor shrink of the scene canvases)
+  drawText(ctx, "SCENE", IW - 104, y0 + 2, SILVER);
+  for (let i = 0; i < BACKDROPS.length; i++) {
+    const bx = IW - 104 + (i % 2) * 51, by = y0 + 11 + Math.floor(i / 2) * 16;
+    ctx.drawImage(BACKDROPS[i].canvas, 0, 0, IW, IH, bx, by, 49, 14);
+    frameRect(ctx, bx, by, 49, 14, live.backdrop === i ? ICE : SLATE);
+    uiBtn(bx, by, 49, 14, ((idx) => () => setBackdrop(idx))(i));
+  }
+}
+
+/* Mini portrait: head+torso of a character rendered once into a 24x22 canvas. */
+const portraitCache = new Map();
+function miniPortrait(spec) {
+  const key = JSON.stringify(spec);
+  let cv = portraitCache.get(key);
+  if (cv) return cv;
+  const [c, cx] = makeCanvas(24, 22);
+  const p = new Puppet(spec, 12, 40, 0);   // feet below the canvas: shows head+torso
+  drawPuppet(cx, p, { clean: true });
+  portraitCache.set(key, c);
+  return c;
+}
+
+/* ---- Selection panel ---------------------------------------------------- */
+function renderSelectionPanel(ctx) {
+  if (!selected || !live.puppets.includes(selected)) return;
+  const p = selected;
+  const x0 = IW - 78, y0 = 16;
+  panel(ctx, x0, y0, 76, 74, NIGHT, SILVER);
+  drawTextC(ctx, p.spec.name, x0 + 38, y0 + 2, SAND);
+  drawText(ctx, "CONTROLS", x0 + 4, y0 + 11, SILVER);
+  let bx = x0 + 4;
+  for (const name of SCHEME_NAMES) {
+    const on = p.scheme === name;
+    const w = 22;
+    panel(ctx, bx, y0 + 19, w, 11, on ? BLUE : DUSK, on ? ICE : SLATE);
+    drawTextC(ctx, SCHEMES[name].label, bx + w / 2, y0 + 21, WHITE);
+    uiBtn(bx, y0 + 19, w, 11, ((n, was) => () => {
+      if (was) p.scheme = null; else assignScheme(live.puppets, p, n);
+    })(name, on));
+    bx += 23;
+  }
+  const rows = [
+    ["BRING FORWARD", () => setLayer(p, "manual", ++zTopCounter)],
+    ["SEND BACK", () => setLayer(p, "manual", --zBackCounter)],
+    [p.layerMode === "auto" ? "DEPTH: AUTO" : "SET AUTO DEPTH", () => setLayer(p, "auto", 0)],
+    ["REMOVE (DEL)", () => removePuppet(p)]
+  ];
+  let ry = y0 + 32;
+  for (const [label, cb] of rows) {
+    panel(ctx, x0 + 4, ry, 68, 9, DUSK, SLATE);
+    drawTextC(ctx, label, x0 + 38, ry + 1, WHITE);
+    uiBtn(x0 + 4, ry, 68, 9, cb);
+    ry += 10;
+  }
+}
+
+/* ---- Top bar ------------------------------------------------------------ */
+function renderTopBar(ctx, speaker) {
+  rect(ctx, 0, 0, IW, 14, NIGHT);
+  let x = 2;
+  const bar = [];
+  if (!recording) {
+    bar.push(["BUILD", () => enterBuilder(-1)]);
+    bar.push(["REC", () => { requestMic(); startRecording(); toast(mic.ok ? "RECORDING!" : "RECORDING (NO MIC - SILENT TAKE)"); }, RED]);
+    if (take) {
+      bar.push(["PLAY", () => enterPlayback(), LIME]);
+      bar.push(["EXPORT", () => { startExport(); }, SKY]);
+      bar.push(["DISCARD", () => { discardTake(); toast("TAKE DISCARDED"); }]);
+    }
+  } else {
+    bar.push(["STOP REC", () => { stopRecording(); toast("TAKE READY - PRESS PLAY"); }, RED]);
+  }
+  bar.push(["HELP (H)", () => { helpOpen = !helpOpen; }]);
+  for (const [label, cb, col] of bar) {
+    const w = textW(label) + 6;
+    panel(ctx, x, 1, w, 12, DUSK, col !== undefined ? col : SLATE);
+    drawText(ctx, label, x + 3, 4, col !== undefined ? col : WHITE);
+    uiBtn(x, 1, w, 12, cb);
+    x += w + 3;
+  }
+  // status, right-aligned
+  if (recording) {
+    const secs = Math.floor((performance.now() - recording.t0) / 1000);
+    const label = "REC " + fmtTime(secs * 1000);
+    if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - textW(label) - 14, 4, 6, 6, RED);
+    drawTextR(ctx, label, IW - 4, 4, RED);
+    frameRect(ctx, 0, 0, IW, IH, RED);
+  } else if (take) {
+    drawTextR(ctx, "TAKE " + fmtTime(take.duration) + " READY", IW - 4, 4, LIME);
+  } else if (!mic.ok && mic.requested) {
+    drawTextR(ctx, "NO MIC", IW - 4, 4, SILVER);
+  }
+  // current speaker indicator
+  if (speaker) {
+    const label = "TALKING: " + speaker.spec.name;
+    rect(ctx, 2, 16, textW(label) + 6, 9, NIGHT);
+    drawText(ctx, label, 5, 17, SAND);
+  }
+}
+
+function fmtTime(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+/* ---- Help overlay ------------------------------------------------------- */
+function renderHelp(ctx) {
+  panel(ctx, 40, 24, 240, 132, NIGHT, ICE);
+  drawTextC(ctx, "HOW TO PLAY", IW / 2, 30, WHITE, 2);
+  const lines = [
+    ["PLAYER 1", "W A S D MOVE", "LEFT SHIFT = TALK"],
+    ["PLAYER 2", "ARROW KEYS MOVE", "RIGHT SHIFT = TALK"],
+    ["PLAYER 3", "I J K L MOVE", "/ = TALK"]
+  ];
+  let y = 52;
+  for (const [who, mv, talk] of lines) {
+    drawText(ctx, who, 50, y, SAND);
+    drawText(ctx, mv, 112, y, WHITE);
+    drawText(ctx, talk, 198, y, ICE);
+    y += 12;
+  }
+  y += 4;
+  drawText(ctx, "CLICK A PUPPET TO SELECT + ASSIGN KEYS", 52, y, SILVER); y += 10;
+  drawText(ctx, "DRAG PUPPETS WITH THE MOUSE", 52, y, SILVER); y += 10;
+  drawText(ctx, "HOLD A TALK KEY AND SPEAK - THE MIC", 52, y, SILVER); y += 8;
+  drawText(ctx, "MOVES THAT PUPPET'S MOUTH", 52, y, SILVER); y += 10;
+  drawText(ctx, "DEL REMOVES THE SELECTED PUPPET", 52, y, SILVER); y += 10;
+  drawText(ctx, "H CLOSES THIS PANEL", 52, y, SILVER);
+  uiBtn(40, 24, 240, 132, () => { helpOpen = false; });
+}
+
+/* ---- Transport (playback mode) ------------------------------------------ */
+const SCRUB = { x: 76, y: IH - 14, w: IW - 130, h: 10 };
+function renderTransport(ctx) {
+  rect(ctx, 0, IH - 18, IW, 18, NIGHT);
+  const t = clamp(playbackClock(), 0, take.duration);
+  const items = [
+    [play.playing ? "PAUSE" : "PLAY", () => { play.playing ? pausePlayback() : resumePlayback(); }],
+    ["STOP", () => exitPlayback()]
+  ];
+  let x = 3;
+  for (const [label, cb] of items) {
+    const w = textW(label) + 6;
+    panel(ctx, x, IH - 15, w, 12, DUSK, SLATE);
+    drawText(ctx, label, x + 3, IH - 12, WHITE);
+    uiBtn(x, IH - 15, w, 12, cb);
+    x += w + 3;
+  }
+  // scrub bar
+  panel(ctx, SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, DUSK, SILVER);
+  const fill = Math.floor((SCRUB.w - 2) * (t / take.duration));
+  rect(ctx, SCRUB.x + 1, SCRUB.y + 1, fill, SCRUB.h - 2, SKY);
+  rect(ctx, SCRUB.x + 1 + fill, SCRUB.y + 1, 1, SCRUB.h - 2, WHITE);
+  uiBtn(SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, (mx) => {
+    scrubbing = true;
+    scrubTo(mx);
+  });
+  drawTextR(ctx, fmtTime(t) + "/" + fmtTime(take.duration), IW - 3, IH - 12, WHITE);
+  drawTextC(ctx, "PLAYBACK", IW / 2, 2, ICE);
+}
+function scrubTo(mx) {
+  const f = clamp((mx - SCRUB.x - 1) / (SCRUB.w - 2), 0, 1);
+  const wasPlaying = play.playing;
+  pausePlayback();
+  seekPlayback(Math.round(f * take.duration));
+  if (wasPlaying) resumePlayback();
+}
+
+/* ---- Toast -------------------------------------------------------------- */
+function renderToast(ctx) {
+  if (!toastMsg || toastT <= 0) return;
+  const w = textW(toastMsg) + 10;
+  const x = (IW - w) >> 1, y = IH - DRAWER_H - 16;
+  panel(ctx, x, y, w, 12, NIGHT, SAND);
+  drawText(ctx, toastMsg, x + 5, y + 3, SAND);
+}
+/* ============================================================================
+   MAIN — fixed-timestep update loop, mouse/key routing, boot.
+   The same STEP drives live performance, playback and export, so all three
+   run at identical speed.
+   ==========================================================================*/
+
+let mode = "stage";   // "stage" | "builder" | "playback" | "export"
+
+/* ---- one fixed step ----------------------------------------------------- */
+function update(dt) {
+  updateMicAmp();
+
+  if (mode === "stage") {
+    // keyboard-driven puppets (all schemes work simultaneously)
+    for (const p of live.puppets) if (p.scheme) driveScheme(p, SCHEMES[p.scheme]);
+    // dragging (converts cursor to internal pixels; positions stay integers)
+    if (dragging) {
+      dragging.p.vx = 0; dragging.p.vy = 0;
+      dragging.p.fx = clamp(mouse.x - dragging.dx, STAGE_MINX, STAGE_MAXX);
+      dragging.p.fy = clamp(mouse.y - dragging.dy, STAGE_MINY, STAGE_MAXY);
+    }
+    // walk cycles from actual movement (drag or keys — same path)
+    for (const p of live.puppets) {
+      const dx = p.fx - (p._pfx !== undefined ? p._pfx : p.fx);
+      if (dragging && dragging.p === p) {
+        if (dx > 0.3) p.facing = 1; else if (dx < -0.3) p.facing = -1;
+      }
+      p.animate(dt, dx);
+      p._pfx = p.fx;
+    }
+    // mouth: one speaker at a time
+    const speaker = currentSpeaker();
+    let amp = 0;
+    if (speaker) amp = mic.ok ? mic.amp : flapAmp(performance.now());
+    const jaw = liveMouth.update(amp, dt);
+    for (const p of live.puppets) p.jaw = (p === speaker) ? jaw : 0;
+    if (recording) recordSample(speaker ? speaker.id : -1, amp);
+  } else if (mode === "playback" || mode === "export") {
+    stepPlayback(dt);
+  }
+  if (toastT > 0) toastT -= dt;
+}
+
+/* ---- render ------------------------------------------------------------- */
+function render(frameDt) {
+  uiButtons = [];
+  if (mode === "builder") {
+    renderBuilder(sctx, frameDt);
+    renderToast(sctx);
+  } else if (mode === "stage") {
+    renderScene(sctx, live, { clean: false });
+    if (live.puppets.length === 0 && !recording) {
+      drawTextC(sctx, "CLICK A PUPPET IN THE ROSTER TO ADD IT TO THE STAGE", IW / 2, 70, WHITE);
+    }
+    renderTopBar(sctx, currentSpeaker());
+    renderSelectionPanel(sctx);
+    renderDrawer(sctx);
+    renderToast(sctx);
+    if (helpOpen) renderHelp(sctx);
+  } else if (mode === "playback") {
+    renderScene(sctx, play, { clean: true });
+    renderTransport(sctx);
+  } else if (mode === "export") {
+    renderScene(sctx, play, { clean: true });
+    captureExportFrame();                       // export gets the clean frame
+    // progress overlay only on the visible screen, never in the file
+    const t = clamp(playbackClock(), 0, take.duration);
+    const pct = Math.floor(100 * t / take.duration);
+    panel(sctx, 80, 80, 160, 30, NIGHT, ICE);
+    drawTextC(sctx, "EXPORTING " + pct + "%", IW / 2, 84, WHITE);
+    rect(sctx, 90, 96, 140, 8, DUSK);
+    rect(sctx, 90, 96, Math.floor(140 * t / take.duration), 8, SKY);
+    panel(sctx, 136, 114, 48, 12, DUSK, SLATE);
+    drawTextC(sctx, "CANCEL", IW / 2, 117, WHITE);
+    uiBtn(136, 114, 48, 12, () => cancelExport());
+  }
+  dctx.drawImage(screen, 0, 0, IW * SCALE, IH * SCALE);
+}
+
+/* ---- mouse routing ------------------------------------------------------ */
+function onMouseDown(x, y) {
+  if (mode === "builder") {
+    textInput = null;             // clicking anywhere blurs the name field...
+    hitUI(x, y);                  // ...unless the click re-focuses it
+    return;
+  }
+  if (mode === "playback" || mode === "export") { hitUI(x, y); return; }
+  // stage
+  if (helpOpen) { hitUI(x, y); return; }
+  if (hitUI(x, y)) return;
+  // pick the topmost puppet under the cursor (composed part bbox)
+  const sorted = sortStage(live.puppets);
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const p = sorted[i], b = p.bbox;
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
+      selected = p;
+      dragging = { p, dx: x - p.x, dy: y - p.y };
+      return;
+    }
+  }
+  selected = null;
+}
+function onMouseMove(x, y) {
+  if (scrubbing && mode === "playback") scrubTo(x);
+}
+function onMouseUp() {
+  dragging = null;
+  scrubbing = false;
+}
+
+/* ---- one-shot keys ------------------------------------------------------ */
+function onKeyPressed(code) {
+  if (code === "KeyH" && (mode === "stage")) helpOpen = !helpOpen;
+  if (code === "Escape") {
+    if (helpOpen) helpOpen = false;
+    else if (mode === "builder") exitBuilder();
+    else if (mode === "playback") exitPlayback();
+    else selected = null;
+  }
+  // Delete removes the selected puppet — never while typing in a text field,
+  // and Backspace/Delete don't collide with any movement scheme.
+  if ((code === "Delete" || code === "Backspace") && mode === "stage" && selected && !textInput) {
+    removePuppet(selected);
+  }
+}
+
+/* ---- boot + loop -------------------------------------------------------- */
+loadRoster();
+
+let lastT = performance.now(), acc = 0;
+function tick(now) {
+  requestAnimationFrame(tick);
+  let frameDt = now - lastT;
+  lastT = now;
+  if (frameDt > 250) frameDt = 250;   // tab was hidden: don't spiral
+  acc += frameDt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render(frameDt);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
