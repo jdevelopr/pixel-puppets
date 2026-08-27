@@ -1391,8 +1391,20 @@ function drawPuppet(ctx, p, opts) {
   const legR = limb(P.legs, f.legR, RIG.hipR);
 
   // z order: left arm, left leg+shoe, right leg+shoe, torso, head, jaw,
-  //          face, hair, hat, right arm, item
+  //          face, hair, hat, right arm, item.
+  // EXCEPTION: while the leading arm's pose frame is in the BACK half of its
+  // swing it passes BEHIND the body (drawn early, occluded by torso and legs)
+  // instead of sweeping across the front — the held item travels with it.
+  const armRBehind = f.armR >= 3 && p.useT <= 0;
+  const drawFrontArm = () => {
+    armR.draw();
+    if (P.item) {
+      const hx = RIG.shoulderR.x + armR.fr.end[0], hy = RIG.shoulderR.y + armR.fr.end[1];
+      acc(blitPart(ctx, P.item.spr, x, y, hx - P.item.ax, hy - P.item.ay, fc));
+    }
+  };
   armL.draw();
+  if (armRBehind) drawFrontArm();
   if (!opts.seated) {
     legL.draw();
     acc(blitPart(ctx, P.shoe, x, y, RIG.hipL.x + legL.fr.end[0] + RIG.shoeDx, RIG.hipL.y + legL.fr.end[1] + RIG.shoeDy, fc));
@@ -1415,11 +1427,7 @@ function drawPuppet(ctx, p, opts) {
   acc(blitPart(ctx, face, x, y, RIG.faceDx, RIG.head.oy + RIG.faceDy + bob, fc));
   if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, RIG.head.ox, RIG.head.oy + P.hair.dy + bob, fc));
   if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, RIG.head.ox, RIG.head.oy + P.hat.dy + bob, fc));
-  armR.draw();
-  if (P.item) {
-    const hx = RIG.shoulderR.x + armR.fr.end[0], hy = RIG.shoulderR.y + armR.fr.end[1];
-    acc(blitPart(ctx, P.item.spr, x, y, hx - P.item.ax, hy - P.item.ay, fc));
-  }
+  if (!armRBehind) drawFrontArm();
   p.bbox = { x: bx0, y: by0, w: bx1 - bx0, h: by1 - by0 };
 }
 
@@ -3061,14 +3069,35 @@ function stepPlayback(dt) {
 /* ============================================================================
    VIDEO EXPORT — plays the timeline from the start (never re-performing the
    show) while capturing an export canvas sized to an exact integer multiple
-   of 320x180 (4x = 1280x720, so the file contains no resampling). Video
-   comes from canvas.captureStream(30); recorded narrator audio is routed
-   through a MediaStreamAudioDestinationNode and mixed in. Selection
-   outlines, controller badges and UI overlays are all hidden.
+   of 320x180 (4x = 1280x720, so the file contains no resampling).
+
+   Frame pacing: the canvas stream is created with captureStream(0) and every
+   frame is pushed explicitly with requestFrame() on an even 30fps grid of
+   SHOW time — never "whenever rAF happened to fire". Irregular canvas-capture
+   timestamps are the classic cause of exported video that stutters and
+   freezes in players; explicit pacing removes it at the source. A tiny Web
+   Worker metronome (workers are exempt from background-tab timer throttling)
+   keeps the whole export loop running even when the window loses focus, so
+   the picture can no longer freeze while the audio track runs on.
    ==========================================================================*/
 
 const EXPORT_SCALE = 4;
-let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType}
+const EXPORT_FPS = 30;
+let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType, ...}
+
+/* An interval that keeps firing in background tabs (falls back to a plain
+   setInterval when Workers/blob URLs are unavailable). */
+function makeTicker(cb, ms) {
+  try {
+    const src = "setInterval(function(){postMessage(0)}," + ms + ");";
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: "application/javascript" })));
+    w.onmessage = cb;
+    return { stop: () => w.terminate() };
+  } catch (e) {
+    const id = setInterval(cb, ms);
+    return { stop: () => clearInterval(id) };
+  }
+}
 
 /* Container preference: MP4 with H.264+AAC first (plays everywhere, including
    QuickTime/iMovie — an .m4v is this same container renamed), then webm. */
@@ -3096,7 +3125,13 @@ function startExport(t, returnTo, isRetry) {
     return; // no MediaRecorder: export unavailable
   }
   if (!isRetry) toast(ext === "mp4" ? "EXPORTING MP4..." : "EXPORTING WEBM (THIS BROWSER CAN'T WRITE MP4)");
-  const stream = cv.captureStream(30);
+  // Explicit frame pushing when the browser supports it, auto-30fps otherwise.
+  let stream = cv.captureStream(0);
+  const vtrack = stream.getVideoTracks()[0];
+  let reqFrame = null;
+  if (vtrack && typeof vtrack.requestFrame === "function") reqFrame = () => vtrack.requestFrame();
+  else if (typeof stream.requestFrame === "function") reqFrame = () => stream.requestFrame();
+  else stream = cv.captureStream(30);
   const hasMusic = !!t.trackData || t.events.some(e => e.type === "music" && e.trackData);
   let audioEl = null, dest = null;
   if (t.audioURL || hasMusic) {
@@ -3111,8 +3146,9 @@ function startExport(t, returnTo, isRetry) {
     const src = audioCtx().createMediaElementSource(audioEl);
     src.connect(dest);
   }
-  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8000000 });
   const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType, ext,
+               reqFrame, lastCapMs: -1e9, finishing: false,
                take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
   exporter = ex;
   recorder.ondataavailable = (e) => { if (e.data.size) ex.chunks.push(e.data); };
@@ -3131,26 +3167,36 @@ function startExport(t, returnTo, isRetry) {
   play.playing = true;
   play.ended = false;
   if (audioEl) audioEl.play().catch(() => { play.audio = null; });
-  recorder.start(250);
-  // Anti-stall pump: if the tab is throttled/backgrounded, rAF stops but the
-  // audio clock keeps running — which would freeze the picture mid-export.
-  // This timer notices starved frames and keeps update+render ticking.
-  ex.pump = setInterval(() => {
+  recorder.start(1000);
+  // Worker metronome: keeps the export loop stepping at full speed even when
+  // the tab is backgrounded (page timers get throttled to 1Hz; workers don't).
+  // When rAF is running normally the metronome sees fresh ticks and stays out
+  // of the way.
+  ex.ticker = makeTicker(() => {
     if (exporter !== ex) return;
     const now = performance.now();
-    if (now - lastTickAt > 150) runFrame(now);
-  }, 100);
+    if (now - lastTickAt > 25) runFrame(now);
+  }, 16);
 }
 
-/* Blit the clean 320x180 frame up to the export canvas (integer 4x). */
-function captureExportFrame() {
+/* Push one export frame: blit the clean 320x180 up to the export canvas
+   (integer 4x) and hand it to the encoder — at most once per 1/30s of SHOW
+   time, so the file's frame timestamps land on an even 30fps grid. */
+function captureExportFrame(force) {
   if (!exporter) return;
+  const t = playbackClock();
+  if (!force && t - exporter.lastCapMs < 1000 / EXPORT_FPS - 1) return;
+  exporter.lastCapMs = t;
   exporter.ctx.drawImage(screen, 0, 0, IW * EXPORT_SCALE, IH * EXPORT_SCALE);
+  if (exporter.reqFrame) exporter.reqFrame();
 }
 
 function finishExport() {
-  if (!exporter) return;
-  if (exporter.recorder.state !== "inactive") exporter.recorder.stop();
+  if (!exporter || exporter.finishing) return;
+  exporter.finishing = true;
+  captureExportFrame(true);              // make sure the last frame lands
+  const ex = exporter;
+  setTimeout(() => { if (ex.recorder.state !== "inactive") ex.recorder.stop(); }, 150);
 }
 
 function cancelExport() {
@@ -3160,7 +3206,7 @@ function cancelExport() {
 }
 
 function deliverExport(ex) {
-  if (ex && ex.pump) clearInterval(ex.pump);
+  if (ex && ex.ticker) ex.ticker.stop();
   if (exporter === ex) exporter = null;
   stopMusic();
   play.active = false;
