@@ -764,7 +764,27 @@ const ITEM_OPTIONS = [
     "d....",
     "d....",
     "d....",
-    "d...."] }
+    "d...."] },
+  { id: "staff", name: "STAFF", ax: 1, ay: 8, rows: [
+    ".bb",
+    "b3b",
+    ".bb",
+    ".3.",
+    ".3.",
+    ".3.",
+    ".3.",
+    ".3.",
+    ".3.",
+    ".3.",
+    ".3."] },
+  { id: "bow", name: "BOW", ax: 1, ay: 4, rows: [
+    ".3c",
+    "3.c",
+    "3.c",
+    "3.c",
+    "3.c",
+    "3.c",
+    ".3c"] }
 ];
 
 /* Jaw states drawn over the chin: 0 closed, 1 open, 2 wide. '1'=mouth dark,
@@ -1190,6 +1210,10 @@ class Puppet {
     this.blinkT = 1500 + Math.random() * 3000;
     this.blinkHold = 0;
     this.jaw = 0;                       // 0 closed / 1 open / 2 wide
+    this.useT = 0;                      // >0: front arm raised (item ability)
+    this.hitT = 0;                      // >0: reaction hop after being hit
+    this.abilityAt = 0;                 // last ability time (cooldown)
+    this.vehicle = null;                // id of the vehicle this puppet drives
     this.bbox = { x: 0, y: 0, w: 0, h: 0 };
   }
   get x() { return Math.floor(this.fx); }
@@ -1217,20 +1241,29 @@ class Puppet {
     this.blinkT -= dt;
     if (this.blinkT <= 0) { this.blinkHold = 140; this.blinkT = 1800 + Math.random() * 3200; }
     if (this.blinkHold > 0) this.blinkHold -= dt;
+    if (this.useT > 0) this.useT -= dt;
+    if (this.hitT > 0) this.hitT -= dt;
   }
 
   frames() {
     const i = this.walkIdx;
     const legR = WALK_SEQ[i];
     const legL = WALK_SEQ[(i + 4) % WALK_SEQ.length];
-    return { legR, legL, armR: legL, armL: legR };   // arms swing opposite legs
+    // While an item ability plays, the front arm snaps to the fully-forward
+    // pose frame (still a discrete frame — nothing rotates).
+    return { legR, legL, armR: this.useT > 0 ? 0 : legL, armL: legR };
   }
 }
 
 /* Draw one puppet. opts: {clean:bool} hides badges. Returns nothing; updates
    p.bbox (composed bounding box of everything drawn) for hit-testing.      */
 function drawPuppet(ctx, p, opts) {
-  const P = p.parts, f = p.frames(), x = p.x, y = p.y, fc = p.facing;
+  const P = p.parts, f = p.frames(), fc = p.facing;
+  // opts.at overrides the draw position (used for a driver seated in a
+  // vehicle); opts.seated skips legs and shoes.
+  const hitOff = p.hitT > 0 ? -((Math.floor(p.hitT / 70) % 2) * 2) : 0;
+  const x = opts.at ? opts.at.x : p.x;
+  const y = (opts.at ? opts.at.y : p.y) + hitOff;
   const bobIdx = p.moving ? BOB_SEQ[p.walkIdx % BOB_SEQ.length]
                           : (Math.floor(p.breathT / 800) % 2);
   const bob = bobIdx;   // 0 or 1 px down
@@ -1252,10 +1285,12 @@ function drawPuppet(ctx, p, opts) {
   // z order: left arm, left leg+shoe, right leg+shoe, torso, head, jaw,
   //          face, hair, hat, right arm, item
   armL.draw();
-  legL.draw();
-  acc(blitPart(ctx, P.shoe, x, y, RIG.hipL.x + legL.fr.end[0] + RIG.shoeDx, RIG.hipL.y + legL.fr.end[1] + RIG.shoeDy, fc));
-  legR.draw();
-  acc(blitPart(ctx, P.shoe, x, y, RIG.hipR.x + legR.fr.end[0] + RIG.shoeDx, RIG.hipR.y + legR.fr.end[1] + RIG.shoeDy, fc));
+  if (!opts.seated) {
+    legL.draw();
+    acc(blitPart(ctx, P.shoe, x, y, RIG.hipL.x + legL.fr.end[0] + RIG.shoeDx, RIG.hipL.y + legL.fr.end[1] + RIG.shoeDy, fc));
+    legR.draw();
+    acc(blitPart(ctx, P.shoe, x, y, RIG.hipR.x + legR.fr.end[0] + RIG.shoeDx, RIG.hipR.y + legR.fr.end[1] + RIG.shoeDy, fc));
+  }
   acc(blitPart(ctx, P.torso, x, y, RIG.torso.ox, RIG.torso.oy, fc));
   acc(blitPart(ctx, P.head, x, y, RIG.head.ox, RIG.head.oy + bob, fc));
   acc(blitPart(ctx, P.jaws[p.jaw], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
@@ -1279,6 +1314,406 @@ function sortStage(puppets) {
     const kb = b.layerMode === "manual" ? b.manualZ : b.y;
     return ka - kb || a.id - b.id;
   });
+}
+/* ============================================================================
+   ITEM ABILITY EFFECTS — projectiles and particles, all drawn from the same
+   pixel-data sprite format at integer positions with palette colors only.
+
+   Every held item has an ability, fired with a scheme's USE key (E / ENTER /
+   U), or SPACE for the selected puppet. Live triggers are recorded to the
+   timeline as {type:"ability", id} events, so playback and export regenerate
+   the same effect — pixels are never stored.
+
+   Effect entity kinds (state.effects array):
+     proj  - moving projectile   {x,y,vx, spr[frames], age, owner, trail, kind}
+     spr   - sprite particle     {x,y,vx,vy,g, ttl, spr[frames], fms, flip}
+     px    - one-pixel particle  {x,y,vx,vy,g, ttl, ci}
+     txt   - a font glyph        {x,y,vx,vy, ttl, ch, ci}
+   To add a new ability: add sprite frames here, a case in spawnAbility, and
+   map the item id in ABILITY_OF.
+   ==========================================================================*/
+
+const FX = {
+  fireball: [
+    [".3333.", "344443", ".3333."],
+    ["..333.", ".34443", "..333."]
+  ],
+  bolt: [
+    ["bbb", "abb"],
+    ["abb", "bba"]
+  ],
+  arrow: [
+    ["3......d.", "33ddddddd", "3......d."]
+  ],
+  poof: [
+    ["..cc..", ".cddc.", "..cc.."],
+    [".c..c.", "..dd..", ".c..c."]
+  ],
+  slash: [
+    ["...cc.", "....cc", ".....c", ".....c", "....cc", "...cc."],
+    ["...bb.", "....bb", ".....b", ".....b", "....bb", "...bb."],
+    ["....c.", ".....c", ".....c", ".....c", ".....c", "....c."]
+  ],
+  note: [
+    ["..0.", "..00", "..0.", "000.", "000."]
+  ]
+};
+/* Item id -> ability kind. */
+const ABILITY_OF = {
+  staff: "fireball", wand: "bolt", bow: "arrow", sword: "slash",
+  balloon: "confetti", flag: "confetti", book: "letters", mic: "notes"
+};
+const CONFETTI_COLORS = [RED, ORANGE, SAND, LIME, SKY, ICE, WHITE];
+
+function fxSprites(key) { return FX[key].map(rows => sprite(rows, {})); }
+
+function addPoof(state, x, y) {
+  state.effects.push({ t: "spr", x, y, vx: 0, vy: 0, g: 0, ttl: 220, spr: fxSprites("poof"), fms: 110, flip: false });
+}
+
+/* Fire the ability of p's held item into state.effects. Returns true if an
+   effect was produced (so live code knows whether to record the event). */
+function spawnAbility(state, p) {
+  const kind = ABILITY_OF[p.spec.slots.item];
+  if (!kind) return false;
+  p.useT = 260;                      // raise the front arm briefly
+  const f = p.facing;
+  const hx = p.x + f * 9, hy = p.y - 18;
+  switch (kind) {
+    case "fireball":
+      state.effects.push({ t: "proj", kind, x: hx, y: hy - 4, vx: 1.7 * f, spr: fxSprites("fireball"), age: 0, owner: p.id, trail: ORANGE });
+      break;
+    case "bolt":
+      state.effects.push({ t: "proj", kind, x: hx, y: hy - 4, vx: 2.2 * f, spr: fxSprites("bolt"), age: 0, owner: p.id, trail: ICE });
+      break;
+    case "arrow":
+      state.effects.push({ t: "proj", kind, x: hx, y: hy - 2, vx: 3.1 * f, spr: fxSprites("arrow"), age: 0, owner: p.id, trail: null });
+      break;
+    case "slash":
+      state.effects.push({ t: "spr", x: p.x + f * 11, y: p.y - 26, vx: f * 0.4, vy: 0, g: 0, ttl: 200, spr: fxSprites("slash"), fms: 70, flip: f < 0 });
+      break;
+    case "confetti":
+      for (let i = 0; i < 16; i++)
+        state.effects.push({ t: "px", x: p.x - 6 + Math.floor(Math.random() * 13), y: p.y - 34,
+          vx: (Math.random() - 0.5) * 1.4, vy: -0.6 - Math.random() * 1.2, g: 0.05, ttl: 700 + Math.random() * 500,
+          ci: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)] });
+      break;
+    case "letters":
+      for (let i = 0; i < 3; i++)
+        state.effects.push({ t: "txt", x: hx + i * 5 * f, y: hy - 6 - i * 3, vx: f * (0.3 + i * 0.1), vy: -0.35,
+          ttl: 900, ch: String.fromCharCode(65 + Math.floor(Math.random() * 26)),
+          ci: [WHITE, SAND, ICE][i % 3] });
+      break;
+    case "notes":
+      for (let i = 0; i < 3; i++)
+        state.effects.push({ t: "spr", x: p.x + (i - 1) * 6, y: p.y - 36 - i * 2, vx: (i - 1) * 0.25, vy: -0.5, g: 0,
+          ttl: 850 + i * 120, spr: [sprite(FX.note[0], { 0: [WHITE, SAND, ICE][i % 3] })], fms: 999, flip: false });
+      break;
+  }
+  return true;
+}
+
+/* Advance all effects one fixed step. Runs identically live, in playback,
+   and during export. */
+function updateEffects(state, dt) {
+  const fx = state.effects;
+  for (let i = fx.length - 1; i >= 0; i--) {
+    const e = fx[i];
+    if (e.t === "proj") {
+      e.x += e.vx;
+      e.age += dt;
+      if (e.trail !== null && Math.floor(e.age / 50) !== Math.floor((e.age - dt) / 50))
+        fx.push({ t: "px", x: Math.floor(e.x - e.vx * 2), y: Math.floor(e.y) + (Math.random() < 0.5 ? 0 : 1),
+                  vx: 0, vy: -0.1, g: 0, ttl: 260, ci: e.trail });
+      // out of the stage: puff and vanish
+      if (e.x < -12 || e.x > IW + 12 || e.age > 4000) { addPoof(state, clamp(e.x, 2, IW - 2), e.y); fx.splice(i, 1); continue; }
+      // hit another puppet (not the shooter, not someone inside a vehicle)
+      let hit = false;
+      for (const q of state.puppets) {
+        if (q.id === e.owner || q.vehicle) continue;
+        const b = q.bbox;
+        if (b && e.x >= b.x && e.x < b.x + b.w && e.y >= b.y && e.y < b.y + b.h) {
+          addPoof(state, e.x, e.y);
+          q.hitT = 320;              // little reaction hop
+          hit = true;
+          break;
+        }
+      }
+      if (hit) { fx.splice(i, 1); continue; }
+    } else {
+      e.x += e.vx; e.y += e.vy; e.vy += e.g || 0;
+      e.age = (e.age || 0) + dt;
+      e.ttl -= dt;
+      if (e.ttl <= 0 || e.y > IH + 8) { fx.splice(i, 1); continue; }
+    }
+  }
+}
+
+function drawEffects(ctx, state) {
+  const bob = Math.floor(performance.now() / 240) % 2;   // gentle float for txt
+  for (const e of state.effects) {
+    if (e.t === "px") {
+      px(ctx, Math.floor(e.x), Math.floor(e.y), e.ci);
+    } else if (e.t === "txt") {
+      drawText(ctx, e.ch, Math.floor(e.x), Math.floor(e.y) + bob, e.ci);
+    } else {
+      const frames = e.spr;
+      const idx = e.t === "proj"
+        ? Math.floor(e.age / 90) % frames.length                       // cycle
+        : Math.min(frames.length - 1, Math.floor((e.age || 0) / e.fms)); // play once
+      const s = frames[idx];
+      const flip = e.t === "proj" ? e.vx < 0 : e.flip;
+      ctx.drawImage(flip ? s.fcv : s.cv, Math.floor(e.x - (s.w >> 1)), Math.floor(e.y - (s.h >> 1)));
+    }
+  }
+}
+/* ============================================================================
+   PROPS + VEHICLES — in-world objects that share the stage with puppets:
+   same integer positions, same y-depth sorting, draggable, selectable,
+   layerable, and recorded to the timeline like puppets.
+
+   Prop def format:
+     { id, name, frames: [rows, ...], fms,   // pixel-data frames + frame ms
+       ox, oy,                               // sprite offset from the origin
+                                             // (origin = ground point, center)
+       vehicle: { seatDx, seatDy,            // where a driver sits
+                  accX, topX, accY, topY } } // driving physics (per step)
+   A vehicle's driver is drawn BEFORE the vehicle sprite, so the vehicle art's
+   transparent opening becomes the cockpit. Boarding: a puppet overlapping a
+   free vehicle presses its USE key (or SPACE when selected). While boarded
+   the puppet's controls drive the vehicle and the puppet rides along; its
+   legs are not drawn. All of it is captured as board/unboard timeline events.
+   ==========================================================================*/
+
+const CAR_TOP = [
+  ".2222222",
+  ".2222222",
+  ".2222222" + ".".repeat(26) + "ccc",
+  ".2222222" + ".".repeat(25) + "cc",
+  "." + "2".repeat(42),
+  "2".repeat(43),
+  "2".repeat(43),
+  "2".repeat(42) + "4",
+  "2".repeat(43),
+  "f" + "2".repeat(41) + "f"
+];
+const CAR_WHEELS_A = [
+  "......000" + ".".repeat(24) + "000",
+  ".....00d00" + ".".repeat(22) + "00d00",
+  ".....0ddd0" + ".".repeat(22) + "0ddd0",
+  ".....00d00" + ".".repeat(22) + "00d00",
+  "......000" + ".".repeat(24) + "000"
+];
+const CAR_WHEELS_B = [
+  "......000" + ".".repeat(24) + "000",
+  ".....0d0d0" + ".".repeat(22) + "0d0d0",
+  ".....00d00" + ".".repeat(22) + "00d00",
+  ".....0d0d0" + ".".repeat(22) + "0d0d0",
+  "......000" + ".".repeat(24) + "000"
+];
+const UFO_BODY = [
+  ".".repeat(14) + "bbbbbbbb",
+  ".".repeat(11) + "bbb" + ".".repeat(8) + "bbb",
+  ".".repeat(9) + "bb" + ".".repeat(14) + "bb",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  ".".repeat(8) + "b" + ".".repeat(18) + "b",
+  "..dd" + "d".repeat(28) + "dd..",
+  "d".repeat(36),
+  "d2ddd5ddda2ddd5ddda2ddd5ddda2ddd5ddd",
+  "." + "d".repeat(34),
+  "..." + "d".repeat(30),
+  "......" + "d".repeat(24),
+  ".........." + "d".repeat(16)
+];
+function ufoFrame(phase) {
+  // swap the running-light colors each frame
+  const swap = (s) => s.replace(/2/g, "#").replace(/5/g, "2").replace(/#/g, "5");
+  return UFO_BODY.map((r, i) => (i === 16 && phase) ? swap(r) : r);
+}
+
+const PROP_DEFS = [
+  { id: "car", name: "CAR", ox: -21, oy: -15, fms: 999,
+    vehicle: { seatDx: -9, seatDy: 2, accX: 0.22, topX: 2.3, accY: 0.1, topY: 0.8 },
+    frames: [CAR_TOP.concat(CAR_WHEELS_A), CAR_TOP.concat(CAR_WHEELS_B)] },
+  { id: "ufo", name: "UFO", ox: -18, oy: -21, fms: 220,
+    vehicle: { seatDx: 0, seatDy: 9, accX: 0.18, topX: 2.0, accY: 0.18, topY: 1.5 },
+    frames: [ufoFrame(0), ufoFrame(1)] },
+  { id: "crate", name: "CRATE", ox: -7, oy: -13, fms: 999, frames: [[
+    "00000000000000",
+    "03333333333330",
+    "03033333333030",
+    "03303333330330",
+    "03330330303330",
+    "03333033033330",
+    "03330330303330",
+    "03303333330330",
+    "03033333333030",
+    "03333333333330",
+    "00000000000000"]] },
+  { id: "fire", name: "CAMPFIRE", ox: -7, oy: -12, fms: 180, frames: [[
+    "......33",
+    ".....343.3",
+    "....33433.",
+    "....34443.",
+    "...3344433",
+    "...3444433",
+    "....34443.",
+    ".0000000000.",
+    "033333333330",
+    ".0000000000."], [
+    "....3..3",
+    "...33.343",
+    "....33433.",
+    "...334443.",
+    "...3444433",
+    "....444433",
+    "....34443.",
+    ".0000000000.",
+    "033333333330",
+    ".0000000000."]] },
+  { id: "bush", name: "BUSH", ox: -9, oy: -13, fms: 999, frames: [[
+    ".....66666",
+    "...6666666666",
+    "..666656666666",
+    ".6666666665666",
+    "666566666666666",
+    "666666656666666",
+    ".6666666666666",
+    "...666..666",
+    "....f....f"]] },
+  { id: "ball", name: "BALL", ox: -5, oy: -9, fms: 999, frames: [[
+    "..cc22..",
+    ".ccc222.",
+    "cccc2222",
+    "cccc2222",
+    "ccc22222",
+    ".cc2222.",
+    "..c222.."]] },
+  { id: "chest", name: "CHEST", ox: -8, oy: -11, fms: 999, frames: [[
+    ".00000000000000.",
+    "0333333333333330",
+    "0333333443333330",
+    "0000000440000000",
+    "0333333443333330",
+    "0333333333333330",
+    "0333333333333330",
+    ".00000000000000."]] },
+  { id: "rock", name: "ROCK", ox: -7, oy: -9, fms: 999, frames: [[
+    "....ddddd",
+    "..ddddddddd",
+    ".ddddeddddd",
+    "dddddddedddd",
+    "dedddddddddd",
+    "eeeeeeeeeeee"]] }
+];
+function propDef(id) { for (const d of PROP_DEFS) if (d.id === id) return d; return PROP_DEFS[0]; }
+
+class Prop {
+  constructor(propId, x, y, id) {
+    this.id = id !== undefined ? id : nextPuppetId++;   // shared id space with puppets
+    this.propId = propId;
+    this.def = propDef(propId);
+    this.sprites = this.def.frames.map(rows => sprite(rows, {}));
+    this.fx = x; this.fy = y;
+    this.vx = 0; this.vy = 0;
+    this.facing = 1;
+    this.layerMode = "auto";
+    this.manualZ = 0;
+    this.isProp = true;
+    this.animT = Math.random() * 999;
+    this.wheelPhase = 0;                                // advanced by distance
+    this.bbox = { x: 0, y: 0, w: 0, h: 0 };
+  }
+  get x() { return Math.floor(this.fx); }
+  get y() { return Math.floor(this.fy); }
+  setPos(x, y) { this.fx = x; this.fy = y; }
+  get isVehicle() { return !!this.def.vehicle; }
+}
+
+function findEntity(state, id) {
+  for (const p of state.puppets) if (p.id === id) return p;
+  for (const p of (state.props || [])) if (p.id === id) return p;
+  return null;
+}
+function driverOf(state, v) {
+  for (const p of state.puppets) if (p.vehicle === v.id) return p;
+  return null;
+}
+
+/* Draw one prop (and its driver, seated, if it's an occupied vehicle). */
+function drawProp(ctx, v, state, opts) {
+  const def = v.def;
+  const driver = v.isVehicle ? driverOf(state, v) : null;
+  if (driver) {
+    const sx = v.x + (v.facing >= 0 ? def.vehicle.seatDx : -def.vehicle.seatDx);
+    drawPuppet(ctx, driver, { clean: opts.clean, seated: true, at: { x: sx, y: v.y + def.vehicle.seatDy } });
+  }
+  let idx = 0;
+  if (v.isVehicle && v.propId === "car") idx = Math.floor(v.wheelPhase) % v.sprites.length;
+  else if (def.fms < 999) idx = Math.floor(v.animT / def.fms) % v.sprites.length;
+  const hover = (v.propId === "ufo") ? (Math.floor(v.animT / 400) % 2) : 0;
+  const s = v.sprites[idx];
+  const r = blitPart(ctx, s, v.x, v.y + hover, def.ox, def.oy, v.facing);
+  // compose bbox over prop + driver so selection/hit-testing covers both
+  if (driver && driver.bbox.w) {
+    const b0 = Math.min(r.x, driver.bbox.x), b1 = Math.max(r.x + r.w, driver.bbox.x + driver.bbox.w);
+    const c0 = Math.min(r.y, driver.bbox.y), c1 = Math.max(r.y + r.h, driver.bbox.y + driver.bbox.h);
+    v.bbox = { x: b0, y: c0, w: b1 - b0, h: c1 - c0 };
+  } else v.bbox = r;
+}
+
+/* ---- boarding ----------------------------------------------------------- */
+function vehicleNear(state, p) {
+  for (const v of state.props) {
+    if (!v.isVehicle || driverOf(state, v)) continue;
+    if (Math.abs(p.x - v.x) < 22 && Math.abs(p.y - v.y) < 14) return v;
+  }
+  return null;
+}
+function boardVehicle(p, v) {
+  p.vehicle = v.id;
+  p.vx = p.vy = 0;
+  if (recording) recEvent({ type: "board", id: p.id, vid: v.id });
+}
+function unboardVehicle(state, p) {
+  const v = findEntity(state, p.vehicle);
+  p.vehicle = null;
+  if (v) {
+    p.fx = clamp(v.fx + (v.facing >= 0 ? -22 : 22), STAGE_MINX, STAGE_MAXX);
+    p.fy = clamp(v.fy, STAGE_MINY, STAGE_MAXY);
+  }
+  if (recording) {
+    recEvent({ type: "unboard", id: p.id });
+    recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
+  }
+}
+
+/* Velocity-based vehicle driving, mirroring driveScheme but faster. */
+function driveVehicle(v, sc) {
+  const V = v.def.vehicle, FRICTION = 0.88;
+  let ix = 0, iy = 0;
+  if (held.has(sc.left)) ix -= 1;
+  if (held.has(sc.right)) ix += 1;
+  if (held.has(sc.up)) iy -= 1;
+  if (held.has(sc.down)) iy += 1;
+  v.vx = ix ? clamp(v.vx + ix * V.accX, -V.topX, V.topX) : v.vx * FRICTION;
+  v.vy = iy ? clamp(v.vy + iy * V.accY, -V.topY, V.topY) : v.vy * FRICTION;
+  if (Math.abs(v.vx) < 0.03) v.vx = 0;
+  if (Math.abs(v.vy) < 0.03) v.vy = 0;
+  if (ix > 0) v.facing = 1; else if (ix < 0) v.facing = -1;
+  const px0 = v.fx;
+  v.fx = clamp(v.fx + v.vx, STAGE_MINX, STAGE_MAXX);
+  v.fy = clamp(v.fy + v.vy, STAGE_MINY, STAGE_MAXY);
+  v.wheelPhase += Math.abs(v.fx - px0) * 0.25;
 }
 /* ============================================================================
    MICROPHONE + MOUTH
@@ -1362,9 +1797,9 @@ function flapAmp(t) { return (Math.floor(t / 200) % 3 === 1) ? 0.12 : 0.05; }
    ==========================================================================*/
 
 const SCHEMES = {
-  WASD:   { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", talk: "ShiftLeft",  label: "WASD" },
-  ARROWS: { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", talk: "ShiftRight", label: "ARWS" },
-  IJKL:   { left: "KeyJ", right: "KeyL", up: "KeyI", down: "KeyK", talk: "Slash",     label: "IJKL" }
+  WASD:   { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", talk: "ShiftLeft",  use: "KeyE",  label: "WASD" },
+  ARROWS: { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", talk: "ShiftRight", use: "Enter", label: "ARWS" },
+  IJKL:   { left: "KeyJ", right: "KeyL", up: "KeyI", down: "KeyK", talk: "Slash",     use: "KeyU",  label: "IJKL" }
 };
 const SCHEME_NAMES = ["WASD", "ARROWS", "IJKL"];
 
@@ -1372,7 +1807,7 @@ const held = new Set();          // e.code of every currently-held key
 let talkStack = [];              // scheme names, in press order (last = active)
 let textInput = null;            // {get,set,max} — routes typing when focused
 
-const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash", "Space"]);
+const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash", "Space", "Enter"]);
 
 window.addEventListener("keydown", (e) => {
   if (textInput) {                       // builder name field has focus
@@ -1476,6 +1911,13 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
      layer    {id, mode, z}              layer-order change ("auto"/"manual")
      backdrop {index}                    scene swap
      speaker  {id}                       active-speaker change (-1 = nobody)
+     spawnProp{id, propId, x, y}         prop/vehicle added to the stage
+     ability  {id}                       puppet fired its held item's ability
+     board    {id, vid}                  puppet climbed into vehicle `vid`
+     unboard  {id}                       puppet climbed out again
+   Props share the id space and the pos/layer/remove event types with
+   puppets. Ability effects are transient eye-candy: they are re-spawned
+   from ability events during playback, never stored as pixels.
    Keyboard motion is recorded exactly like dragging — as resulting position
    keyframes — so playback never replays input.
 
@@ -1504,6 +1946,14 @@ function startRecording() {
       recording.events.push({ t: 0, type: "layer", id: p.id, mode: "manual", z: p.manualZ });
     recording.lastPos.set(p.id, { x: p.x, y: p.y, t: 0 });
   }
+  for (const v of live.props) {
+    recording.events.push({ t: 0, type: "spawnProp", id: v.id, propId: v.propId, x: v.x, y: v.y });
+    if (v.layerMode === "manual")
+      recording.events.push({ t: 0, type: "layer", id: v.id, mode: "manual", z: v.manualZ });
+    recording.lastPos.set(v.id, { x: v.x, y: v.y, t: 0 });
+  }
+  for (const p of live.puppets)
+    if (p.vehicle) recording.events.push({ t: 0, type: "board", id: p.id, vid: p.vehicle });
   recording.events.push({ t: 0, type: "speaker", id: -1 });
   recording.lastSpeaker = -1;
   recording.lastAmp = -1;
@@ -1520,7 +1970,7 @@ function startRecording() {
 /* Called every fixed step while recording. */
 function recordSample(speakerId, amp) {
   const t = recNow();
-  for (const p of live.puppets) {
+  for (const p of [...live.puppets, ...live.props]) {
     const last = recording.lastPos.get(p.id);
     if (!last || ((last.x !== p.x || last.y !== p.y) && t - last.t >= 33)) {
       recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
@@ -1540,8 +1990,8 @@ function recordSample(speakerId, amp) {
 function stopRecording() {
   const rec = recording;
   const duration = recNow();
-  // final position keyframe for every puppet so playback ends in place
-  for (const p of live.puppets) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
+  // final position keyframe for everything so playback ends in place
+  for (const p of [...live.puppets, ...live.props]) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
   const finalize = (audioBlob) => {
     if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
     take = {
@@ -1566,7 +2016,7 @@ function stopRecording() {
 function buildKeyframes(events) {
   const map = new Map();
   for (const ev of events) {
-    if (ev.type === "spawn") {
+    if (ev.type === "spawn" || ev.type === "spawnProp") {
       if (!map.has(ev.id)) map.set(ev.id, []);
       map.get(ev.id).push({ t: ev.t, x: ev.x, y: ev.y });
     } else if (ev.type === "pos") {
@@ -1597,6 +2047,8 @@ const play = {
   t: 0,
   playing: false,
   puppets: [],          // separate instances; the live stage is untouched
+  props: [],
+  effects: [],
   backdrop: 0,
   speakerId: -1,
   eventIdx: 0,
@@ -1642,6 +2094,8 @@ function exitPlayback() {
   pausePlayback();
   play.active = false;
   play.puppets = [];
+  play.props = [];
+  play.effects = [];
   play.audio = null;
   mode = play.returnTo || "stage";
 }
@@ -1651,6 +2105,8 @@ function exitPlayback() {
 function seekPlayback(t) {
   t = clamp(t, 0, play.take.duration);
   play.puppets = [];
+  play.props = [];
+  play.effects = [];      // transient effects don't survive a scrub — fine
   play.backdrop = live.backdrop;
   play.speakerId = -1;
   play.eventIdx = 0;
@@ -1677,25 +2133,45 @@ function applyEvent(ev) {
       play.puppets.push(p);
       break;
     }
+    case "spawnProp": {
+      play.props.push(new Prop(ev.propId, ev.x, ev.y, ev.id));
+      break;
+    }
     case "remove": {
       play.puppets = play.puppets.filter(p => p.id !== ev.id);
+      play.props = play.props.filter(p => p.id !== ev.id);
       break;
     }
     case "pos": break;   // handled by keyframe interpolation
     case "layer": {
-      const p = findPlayPuppet(ev.id);
+      const p = findEntity(play, ev.id);
       if (p) { p.layerMode = ev.mode; p.manualZ = ev.z || 0; }
       break;
     }
     case "backdrop": play.backdrop = ev.index; break;
     case "speaker": play.speakerId = ev.id; break;
+    case "ability": {
+      const p = findPlayPuppet(ev.id);
+      if (p) spawnAbility(play, p);
+      break;
+    }
+    case "board": {
+      const p = findPlayPuppet(ev.id);
+      if (p) p.vehicle = ev.vid;
+      break;
+    }
+    case "unboard": {
+      const p = findPlayPuppet(ev.id);
+      if (p) p.vehicle = null;
+      break;
+    }
   }
 }
 
 /* Interpolate between position keyframes, floor to integers at assignment,
    and feed the deltas into the same walk-cycle logic used live. */
 function updatePlaybackPositions(t, dt) {
-  for (const p of play.puppets) {
+  for (const p of [...play.puppets, ...play.props]) {
     const kf = play.take.keyframes.get(p.id);
     if (!kf || !kf.length) continue;
     let a = kf[0], b = kf[kf.length - 1];
@@ -1709,7 +2185,14 @@ function updatePlaybackPositions(t, dt) {
     const dx = nx - p.fx;
     if (dx > 0.05) p.facing = 1; else if (dx < -0.05) p.facing = -1;
     p.setPos(nx, ny);
-    p.animate(dt, dx);
+    if (p.isProp) { p.animT += dt; p.wheelPhase += Math.abs(dx) * 0.25; }
+    else p.animate(dt, p.vehicle ? 0 : dx);   // no walk cycle while riding
+  }
+  // a boarded puppet's facing follows its vehicle
+  for (const p of play.puppets) {
+    if (!p.vehicle) continue;
+    const v = findEntity(play, p.vehicle);
+    if (v) p.facing = v.facing;
   }
 }
 
@@ -1733,6 +2216,7 @@ function stepPlayback(dt) {
   const amp = currentAmp(t);
   const jaw = play.mouth.update(amp, dt);
   for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
+  updateEffects(play, dt);
   if (t >= play.take.duration) {
     play.playing = false;
     play.ended = true;
@@ -1875,7 +2359,7 @@ function prebuiltRoster() {
   return [
     makeSpec("SIR BLOO", { hat: "helmet", torso: "armor", arms: "armor", legs: "armor", shoes: "boot", item: "sword", face: "dot" },
              { hat: SILVER, torso: SKY, arms: SKY, legs: SLATE, shoes: DUSK, item: BLUE }),
-    makeSpec("MERLA", { hat: "wizard", hair: "long", torso: "dress", arms: "robe", legs: "pants", shoes: "boot", item: "wand", face: "big", head: "egg" },
+    makeSpec("MERLA", { hat: "wizard", hair: "long", torso: "dress", arms: "robe", legs: "pants", shoes: "boot", item: "staff", face: "big", head: "egg" },
              { hat: PLUM, hair: WHITE, torso: PLUM, arms: PLUM, legs: DUSK, shoes: DUSK, item: BLUE, skin: SAND }),
     makeSpec("ZIP-7", { hat: "helmet", torso: "armor", arms: "long", legs: "armor", shoes: "boot", item: "flag", face: "shades", head: "square" },
              { hat: WHITE, torso: WHITE, arms: WHITE, legs: WHITE, shoes: RED, item: GREEN, skin: ORANGE }),
@@ -2200,9 +2684,10 @@ function renderBuilder(ctx, dt) {
    STAGE — live scene rendering, drawer, selection UI, transport, overlays.
    ==========================================================================*/
 
-const live = { puppets: [], backdrop: 0 };
+const live = { puppets: [], props: [], effects: [], backdrop: 0 };
 let selected = null;
 let drawerOpen = true;
+let drawerTab = "cast";   // "cast" | "props"
 let helpOpen = false;
 let zTopCounter = 1000, zBackCounter = -1000;
 let toastMsg = null, toastT = 0;
@@ -2215,8 +2700,22 @@ function spawnPuppet(spec, x, y) {
   if (recording) recEvent({ type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
   return p;
 }
+function spawnStageProp(propId, x, y) {
+  const v = new Prop(propId, x !== undefined ? x : 100 + Math.floor(Math.random() * 120),
+                             y !== undefined ? y : 125 + Math.floor(Math.random() * 40));
+  live.props.push(v);
+  if (recording) recEvent({ type: "spawnProp", id: v.id, propId: v.propId, x: v.x, y: v.y });
+  return v;
+}
 function removePuppet(p) {
-  live.puppets = live.puppets.filter(q => q !== p);
+  if (p.isProp) {
+    const d = driverOf(live, p);            // eject a driver before towing
+    if (d) unboardVehicle(live, d);
+    live.props = live.props.filter(q => q !== p);
+  } else {
+    if (p.vehicle) p.vehicle = null;
+    live.puppets = live.puppets.filter(q => q !== p);
+  }
   if (selected === p) selected = null;
   if (dragging && dragging.p === p) dragging = null;
   if (recording) recEvent({ type: "remove", id: p.id });
@@ -2244,8 +2743,12 @@ function currentSpeaker() {
 /* ---- Scene rendering (shared by live, playback and export) -------------- */
 function renderScene(ctx, state, opts) {
   ctx.drawImage(BACKDROPS[state.backdrop].canvas, 0, 0);
-  const sorted = sortStage(state.puppets);
-  for (const p of sorted) drawPuppet(ctx, p, opts);
+  const sorted = sortStage([...state.puppets, ...(state.props || [])]);
+  for (const p of sorted) {
+    if (p.isProp) drawProp(ctx, p, state, opts);
+    else if (!p.vehicle) drawPuppet(ctx, p, opts);   // drivers drawn by vehicle
+  }
+  if (state.effects) drawEffects(ctx, state);
   if (!opts.clean) {
     for (const p of sorted) {
       if (p.scheme) {   // controller badge, hidden during playback/export
@@ -2256,7 +2759,7 @@ function renderScene(ctx, state, opts) {
         drawText(ctx, label, bx + 2, by + 1, ICE);
       }
     }
-    if (selected && live.puppets.includes(selected)) {
+    if (selected && (live.puppets.includes(selected) || live.props.includes(selected))) {
       const b = selected.bbox;
       dashRect(ctx, b.x - 1, b.y - 1, b.w + 2, b.h + 2, ICE, Math.floor(performance.now() / 120) & 7);
     }
@@ -2274,38 +2777,65 @@ function renderDrawer(ctx) {
     return;
   }
   panel(ctx, 0, y0, IW, DRAWER_H, NIGHT, SILVER);
-  drawText(ctx, "ROSTER - CLICK TO ADD", 4, y0 + 2, SILVER);
+  // tabs: puppet roster / props+vehicles
+  for (const [tab, label, tx] of [["cast", "PUPPETS", 4], ["props", "PROPS", 52]]) {
+    const on = drawerTab === tab;
+    panel(ctx, tx, y0, 44, 10, on ? NAVY : NIGHT, on ? ICE : SLATE);
+    drawTextC(ctx, label, tx + 22, y0 + 2, on ? WHITE : SILVER);
+    uiBtn(tx, y0, 44, 10, () => { drawerTab = tab; });
+  }
+  drawText(ctx, "CLICK TO ADD", 102, y0 + 2, SILVER);
   panel(ctx, IW - 34, y0, 34, 10, DUSK, SILVER);
   drawText(ctx, "HIDE", IW - 28, y0 + 2, WHITE);
   uiBtn(IW - 34, y0, 34, 10, () => { drawerOpen = false; });
 
-  // roster cells: a mini live portrait of each character
   let x = 4;
   const cy = y0 + 11;
-  for (let i = 0; i < roster.length && x < IW - 110; i++) {
-    const spec = roster[i];
-    panel(ctx, x, cy, 26, 24, DUSK, SLATE);
-    const mini = miniPortrait(spec);
-    ctx.drawImage(mini, x + 1, cy + 1);
-    uiBtn(x, cy, 26, 24, ((idx) => () => {
-      const p = spawnPuppet(roster[idx]);
-      selected = p;
-      toast("ADDED " + roster[idx].name);
-    })(i));
-    if (!recording) {   // no costume edits mid-take
-      panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
-      drawTextC(ctx, "EDIT", x + 13, cy + 26, WHITE);
-      uiBtn(x, cy + 25, 26, 8, ((idx) => () => enterBuilder(idx))(i));
+  if (drawerTab === "cast") {
+    // roster cells: a mini live portrait of each character
+    for (let i = 0; i < roster.length && x < IW - 110; i++) {
+      const spec = roster[i];
+      panel(ctx, x, cy, 26, 24, DUSK, SLATE);
+      const mini = miniPortrait(spec);
+      ctx.drawImage(mini, x + 1, cy + 1);
+      uiBtn(x, cy, 26, 24, ((idx) => () => {
+        const p = spawnPuppet(roster[idx]);
+        selected = p;
+        toast("ADDED " + roster[idx].name);
+      })(i));
+      if (!recording) {   // no costume edits mid-take
+        panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
+        drawTextC(ctx, "EDIT", x + 13, cy + 26, WHITE);
+        uiBtn(x, cy + 25, 26, 8, ((idx) => () => enterBuilder(idx))(i));
+      }
+      x += 28;
     }
-    x += 28;
-  }
-  // new character cell
-  if (!recording) {
-    panel(ctx, x, cy, 26, 24, DUSK, SLATE);
-    drawTextC(ctx, "+", x + 13, cy + 8, LIME);
-    uiBtn(x, cy, 26, 33, () => enterBuilder(-1));
-    panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
-    drawTextC(ctx, "NEW", x + 13, cy + 26, WHITE);
+    // new character cell
+    if (!recording) {
+      panel(ctx, x, cy, 26, 24, DUSK, SLATE);
+      drawTextC(ctx, "+", x + 13, cy + 8, LIME);
+      uiBtn(x, cy, 26, 33, () => enterBuilder(-1));
+      panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
+      drawTextC(ctx, "NEW", x + 13, cy + 26, WHITE);
+    }
+  } else {
+    // props + vehicles
+    for (const def of PROP_DEFS) {
+      if (x >= IW - 110) break;
+      panel(ctx, x, cy, 25, 24, DUSK, SLATE);
+      const s = sprite(def.frames[0], {});
+      const fit = Math.min(1, Math.min(23 / s.w, 22 / s.h));
+      const dw = Math.max(1, Math.floor(s.w * fit)), dh = Math.max(1, Math.floor(s.h * fit));
+      ctx.drawImage(s.cv, x + 1 + ((23 - dw) >> 1), cy + 1 + ((22 - dh) >> 1), dw, dh);
+      uiBtn(x, cy, 25, 24, ((id2) => () => {
+        selected = spawnStageProp(id2);
+        toast("ADDED " + id2.toUpperCase());
+      })(def.id));
+      panel(ctx, x, cy + 25, 25, 8, NAVY, SLATE);
+      const short = def.vehicle ? "DRIVE" : "PROP";
+      drawTextC(ctx, short, x + 12, cy + 26, def.vehicle ? ICE : SILVER);
+      x += 26;
+    }
   }
 
   // backdrop thumbnails (nearest-neighbor shrink of the scene canvases)
@@ -2333,22 +2863,29 @@ function miniPortrait(spec) {
 
 /* ---- Selection panel ---------------------------------------------------- */
 function renderSelectionPanel(ctx) {
-  if (!selected || !live.puppets.includes(selected)) return;
+  if (!selected || !(live.puppets.includes(selected) || live.props.includes(selected))) return;
   const p = selected;
+  const isProp = !!p.isProp;
   const x0 = IW - 78, y0 = 16;
-  panel(ctx, x0, y0, 76, 74, NIGHT, SILVER);
-  drawTextC(ctx, p.spec.name, x0 + 38, y0 + 2, SAND);
-  drawText(ctx, "CONTROLS", x0 + 4, y0 + 11, SILVER);
-  let bx = x0 + 4;
-  for (const name of SCHEME_NAMES) {
-    const on = p.scheme === name;
-    const w = 22;
-    panel(ctx, bx, y0 + 19, w, 11, on ? BLUE : DUSK, on ? ICE : SLATE);
-    drawTextC(ctx, SCHEMES[name].label, bx + w / 2, y0 + 21, WHITE);
-    uiBtn(bx, y0 + 19, w, 11, ((n, was) => () => {
-      if (was) p.scheme = null; else assignScheme(live.puppets, p, n);
-    })(name, on));
-    bx += 23;
+  panel(ctx, x0, y0, 76, isProp ? 56 : 84, NIGHT, SILVER);
+  drawTextC(ctx, isProp ? p.def.name : p.spec.name, x0 + 38, y0 + 2, SAND);
+  let ry;
+  if (!isProp) {
+    drawText(ctx, "CONTROLS", x0 + 4, y0 + 11, SILVER);
+    let bx = x0 + 4;
+    for (const name of SCHEME_NAMES) {
+      const on = p.scheme === name;
+      const w = 22;
+      panel(ctx, bx, y0 + 19, w, 11, on ? BLUE : DUSK, on ? ICE : SLATE);
+      drawTextC(ctx, SCHEMES[name].label, bx + w / 2, y0 + 21, WHITE);
+      uiBtn(bx, y0 + 19, w, 11, ((n, was) => () => {
+        if (was) p.scheme = null; else assignScheme(live.puppets, p, n);
+      })(name, on));
+      bx += 23;
+    }
+    ry = y0 + 32;
+  } else {
+    ry = y0 + 12;
   }
   const rows = [
     ["BRING FORWARD", () => setLayer(p, "manual", ++zTopCounter)],
@@ -2356,7 +2893,7 @@ function renderSelectionPanel(ctx) {
     [p.layerMode === "auto" ? "DEPTH: AUTO" : "SET AUTO DEPTH", () => setLayer(p, "auto", 0)],
     ["REMOVE (DEL)", () => removePuppet(p)]
   ];
-  let ry = y0 + 32;
+  if (!isProp) rows.push([p.vehicle ? "EXIT RIDE (SPC)" : "USE ITEM (SPC)", () => useAction(p)]);
   for (const [label, cb] of rows) {
     panel(ctx, x0 + 4, ry, 68, 9, DUSK, SLATE);
     drawTextC(ctx, label, x0 + 38, ry + 1, WHITE);
@@ -2421,24 +2958,25 @@ function renderHelp(ctx) {
   panel(ctx, 40, 24, 240, 132, NIGHT, ICE);
   drawTextC(ctx, "HOW TO PLAY", IW / 2, 30, WHITE, 2);
   const lines = [
-    ["PLAYER 1", "W A S D MOVE", "LEFT SHIFT = TALK"],
-    ["PLAYER 2", "ARROW KEYS MOVE", "RIGHT SHIFT = TALK"],
-    ["PLAYER 3", "I J K L MOVE", "/ = TALK"]
+    ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE"],
+    ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE"],
+    ["PLAYER 3", "IJKL MOVE", "/ TALK", "U USE"]
   ];
   let y = 52;
-  for (const [who, mv, talk] of lines) {
-    drawText(ctx, who, 50, y, SAND);
-    drawText(ctx, mv, 112, y, WHITE);
-    drawText(ctx, talk, 198, y, ICE);
+  for (const [who, mv, talk, use] of lines) {
+    drawText(ctx, who, 48, y, SAND);
+    drawText(ctx, mv, 104, y, WHITE);
+    drawText(ctx, talk, 172, y, ICE);
+    drawText(ctx, use, 236, y, LIME);
     y += 12;
   }
   y += 4;
-  drawText(ctx, "CLICK A PUPPET TO SELECT + ASSIGN KEYS", 52, y, SILVER); y += 10;
-  drawText(ctx, "DRAG PUPPETS WITH THE MOUSE", 52, y, SILVER); y += 10;
-  drawText(ctx, "HOLD A TALK KEY AND SPEAK - THE MIC", 52, y, SILVER); y += 8;
-  drawText(ctx, "MOVES THAT PUPPET'S MOUTH", 52, y, SILVER); y += 10;
-  drawText(ctx, "DEL REMOVES THE SELECTED PUPPET", 52, y, SILVER); y += 10;
-  drawText(ctx, "H CLOSES THIS PANEL", 52, y, SILVER);
+  drawText(ctx, "USE FIRES YOUR ITEM - STAFF, BOW, SWORD...", 48, y, SILVER); y += 10;
+  drawText(ctx, "USE NEXT TO A CAR OR UFO HOPS IN / OUT", 48, y, SILVER); y += 10;
+  drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 10;
+  drawText(ctx, "DRAG PUPPETS AND PROPS WITH THE MOUSE", 48, y, SILVER); y += 10;
+  drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 10;
+  drawText(ctx, "DEL REMOVES - H CLOSES THIS PANEL", 48, y, SILVER);
   uiBtn(40, 24, 240, 132, () => { helpOpen = false; });
 }
 
@@ -2605,13 +3143,33 @@ function update(dt) {
   updateMicAmp();
 
   if (mode === "stage") {
-    // keyboard-driven puppets (all schemes work simultaneously)
-    for (const p of live.puppets) if (p.scheme) driveScheme(p, SCHEMES[p.scheme]);
+    // keyboard-driven puppets (all schemes work simultaneously); a boarded
+    // puppet's controls drive its vehicle instead
+    for (const p of live.puppets) {
+      if (!p.scheme) continue;
+      if (p.vehicle) {
+        const v = findEntity(live, p.vehicle);
+        if (v) driveVehicle(v, SCHEMES[p.scheme]);
+      } else driveScheme(p, SCHEMES[p.scheme]);
+    }
     // dragging (converts cursor to internal pixels; positions stay integers)
     if (dragging) {
       dragging.p.vx = 0; dragging.p.vy = 0;
       dragging.p.fx = clamp(mouse.x - dragging.dx, STAGE_MINX, STAGE_MAXX);
       dragging.p.fy = clamp(mouse.y - dragging.dy, STAGE_MINY, STAGE_MAXY);
+    }
+    // riders follow their vehicles
+    for (const p of live.puppets) {
+      if (!p.vehicle) continue;
+      const v = findEntity(live, p.vehicle);
+      if (v) { p.fx = v.fx; p.fy = v.fy; p.facing = v.facing; }
+    }
+    // props: animation timers + wheel roll when dragged
+    for (const v of live.props) {
+      v.animT += dt;
+      const dvx = v.fx - (v._pfx !== undefined ? v._pfx : v.fx);
+      if (dragging && dragging.p === v) v.wheelPhase += Math.abs(dvx) * 0.25;
+      v._pfx = v.fx;
     }
     // walk cycles from actual movement (drag or keys — same path)
     for (const p of live.puppets) {
@@ -2619,9 +3177,10 @@ function update(dt) {
       if (dragging && dragging.p === p) {
         if (dx > 0.3) p.facing = 1; else if (dx < -0.3) p.facing = -1;
       }
-      p.animate(dt, dx);
+      p.animate(dt, p.vehicle ? 0 : dx);
       p._pfx = p.fx;
     }
+    updateEffects(live, dt);
     // mouth: one speaker at a time
     const speaker = currentSpeaker();
     let amp = 0;
@@ -2693,17 +3252,32 @@ function onMouseDown(x, y) {
   // stage
   if (helpOpen) { hitUI(x, y); return; }
   if (hitUI(x, y)) return;
-  // pick the topmost puppet under the cursor (composed part bbox)
-  const sorted = sortStage(live.puppets);
+  // pick the topmost puppet or prop under the cursor (composed part bbox);
+  // a boarded puppet is reached through its vehicle
+  const sorted = sortStage([...live.puppets, ...live.props]);
   for (let i = sorted.length - 1; i >= 0; i--) {
     const p = sorted[i], b = p.bbox;
-    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
+    if (!p.isProp && p.vehicle) continue;
+    if (b && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
       selected = p;
       dragging = { p, dx: x - p.x, dy: y - p.y };
       return;
     }
   }
   selected = null;
+}
+
+/* USE for one puppet: exit/enter a nearby vehicle, else fire the held item.
+   Live-only; playback regenerates the same things from recorded events. */
+function useAction(p) {
+  if (mode !== "stage" || !p || p.isProp) return;
+  const now = performance.now();
+  if (now - p.abilityAt < 350) return;      // cooldown
+  p.abilityAt = now;
+  if (p.vehicle) { unboardVehicle(live, p); return; }
+  const v = vehicleNear(live, p);
+  if (v) { boardVehicle(p, v); return; }
+  if (spawnAbility(live, p) && recording) recEvent({ type: "ability", id: p.id });
 }
 function onMouseMove(x, y) {
   if (scrubbing && mode === "playback") scrubTo(x);
@@ -2716,6 +3290,18 @@ function onMouseUp() {
 /* ---- one-shot keys ------------------------------------------------------ */
 function onKeyPressed(code) {
   if (code === "KeyH" && (mode === "stage")) helpOpen = !helpOpen;
+  // item ability / vehicle boarding, per control scheme
+  if (mode === "stage" && !textInput) {
+    for (const name of SCHEME_NAMES) {
+      if (SCHEMES[name].use !== code) continue;
+      for (const p of live.puppets) if (p.scheme === name) useAction(p);
+    }
+    if (code === "Space") {
+      const target = (dragging && !dragging.p.isProp) ? dragging.p
+                   : (selected && !selected.isProp && live.puppets.includes(selected)) ? selected : null;
+      if (target) useAction(target);
+    }
+  }
   if (code === "Escape") {
     if (helpOpen) helpOpen = false;
     else if (mode === "builder") exitBuilder();
