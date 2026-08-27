@@ -2446,6 +2446,22 @@ function duckMusic(ducked) {
   const ctx = audioCtx();
   music.playing.bus.gain.setTargetAtTime(ducked ? 0.22 : 0.6, ctx.currentTime, 0.08);
 }
+
+/* Live music cue from the stage (number keys / cue bar). While recording it
+   lands in the timeline as a {type:"music", trackData} event — trackData is
+   a full embedded copy (null = stop) — so mid-take switches replay exactly. */
+function cueMusic(track) {
+  audioCtx();
+  if (!track) {
+    stopMusic();
+    if (recording) recEvent({ type: "music", trackData: null });
+    toast("MUSIC OFF");
+    return;
+  }
+  playTrack(track, {});
+  if (recording) recEvent({ type: "music", trackData: JSON.parse(JSON.stringify(track)) });
+  toast("NOW PLAYING: " + track.name);
+}
 /* ============================================================================
    INPUT — three keyboard control schemes usable simultaneously on one
    keyboard, plus mouse handling. Key state lives in a held-keys set updated
@@ -2587,6 +2603,8 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
      weather  {kind}                     weather overlay change
      wipe     {}                         scene-wipe transition (the backdrop
                                          event lands mid-wipe, ~350ms later)
+     music    {trackData}                music cue: start this embedded track
+                                         here (null = stop the music)
    Props share the id space and the pos/layer/remove event types with
    puppets. Ability effects are transient eye-candy: they are re-spawned
    from ability events during playback, never stored as pixels.
@@ -2614,10 +2632,14 @@ function startRecording() {
   // Snapshot initial state at t=0 so playback can reconstruct the stage.
   recording.events.push({ t: 0, type: "backdrop", index: live.backdrop });
   recording.events.push({ t: 0, type: "weather", kind: live.weather });
-  // theme song: play it live under the take, aligned to t=0
-  const tr = currentTrack();
+  // theme song: whatever is cued live wins, else the studio's "next show"
+  // pick. Restarted at t=0 and recorded as the take's first music event.
+  const tr = music.playing ? music.playing.track : currentTrack();
   recording.trackData = tr ? JSON.parse(JSON.stringify(tr)) : null;
-  if (tr) playTrack(tr, {});
+  if (tr) {
+    recording.events.push({ t: 0, type: "music", trackData: recording.trackData });
+    playTrack(tr, {});
+  }
   for (const p of live.puppets) {
     recording.events.push({ t: 0, type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
     if (p.layerMode === "manual")
@@ -2735,6 +2757,9 @@ const play = {
   bubbles: [],
   weather: "none",
   wipeAt: -1e9,
+  musicEv: null,        // active {t, trackData} music event (null = silence)
+  musicApplied: null,   // last event actually started, to detect changes
+  musicOuts: null,      // where the synth routes (export sets the mix node)
   backdrop: 0,
   speakerId: -1,
   eventIdx: 0,
@@ -2754,11 +2779,13 @@ function playbackClock() {
 
 function enterPlayback(t, returnTo) {
   if (!t) return;
+  stopMusic();               // a live cue doesn't bleed into playback
   mode = "playback";
   play.take = t;
   play.returnTo = returnTo || "stage";
   play.active = true;
   play.exporting = false;
+  play.musicOuts = null;     // playback music goes to the speakers
   if (t.audioURL) {
     play.audio = new Audio(t.audioURL);
   } else play.audio = null;
@@ -2771,13 +2798,13 @@ function resumePlayback() {
   play.playing = true;
   play.ended = false;
   if (play.audio) play.audio.play().catch(() => { play.audio = null; });
-  if (play.take.trackData && !play.exporting)
-    playTrack(play.take.trackData, { offsetMs: playbackClock() });
+  play.musicApplied = {};   // force the next step to re-sync the music cue
 }
 function pausePlayback() {
   play.playing = false;
   if (play.audio) play.audio.pause();
-  if (!play.exporting) stopMusic();
+  stopMusic();
+  play.musicApplied = {};
 }
 function exitPlayback() {
   pausePlayback();
@@ -2799,6 +2826,13 @@ function seekPlayback(t) {
   play.bubbles = [];
   play.weather = "none";
   play.wipeAt = -1e9;
+  // legacy takes carried one track with no music events — treat it as a cue
+  // at t=0; newer takes set musicEv through their music events below
+  if (play.take._hasMusicEv === undefined)
+    play.take._hasMusicEv = play.take.events.some(e => e.type === "music");
+  play.musicEv = (!play.take._hasMusicEv && play.take.trackData)
+    ? { t: 0, trackData: play.take.trackData } : null;
+  play.musicApplied = {};
   play.backdrop = live.backdrop;
   play.speakerId = -1;
   play.eventIdx = 0;
@@ -2873,6 +2907,7 @@ function applyEvent(ev) {
     }
     case "weather": play.weather = ev.kind; break;
     case "wipe": play.wipeAt = ev.t; break;   // rendered from show-time
+    case "music": play.musicEv = ev.trackData ? ev : null; break;
   }
 }
 
@@ -2921,6 +2956,14 @@ function stepPlayback(dt) {
   while (play.eventIdx < play.take.events.length && play.take.events[play.eventIdx].t <= t)
     applyEvent(play.take.events[play.eventIdx++]);
   updatePlaybackPositions(t, dt);
+  // music cue changes (or a resume/seek) restart the synth mid-pattern
+  if (play.musicEv !== play.musicApplied) {
+    play.musicApplied = play.musicEv;
+    const mev = play.musicEv;
+    if (mev && mev.trackData)
+      playTrack(mev.trackData, { offsetMs: Math.max(0, t - mev.t), outs: play.musicOuts || undefined });
+    else stopMusic();
+  }
   const amp = currentAmp(t);
   const jaw = play.mouth.update(amp, dt);
   for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
@@ -2973,8 +3016,9 @@ function startExport(t, returnTo, isRetry) {
   }
   if (!isRetry) toast(ext === "mp4" ? "EXPORTING MP4..." : "EXPORTING WEBM (THIS BROWSER CAN'T WRITE MP4)");
   const stream = cv.captureStream(30);
+  const hasMusic = !!t.trackData || t.events.some(e => e.type === "music" && e.trackData);
   let audioEl = null, dest = null;
-  if (t.audioURL || t.trackData) {
+  if (t.audioURL || hasMusic) {
     const ctx = audioCtx();
     dest = ctx.createMediaStreamDestination();
     for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
@@ -2986,7 +3030,6 @@ function startExport(t, returnTo, isRetry) {
     const src = audioCtx().createMediaElementSource(audioEl);
     src.connect(dest);
   }
-  if (t.trackData) playTrack(t.trackData, { outs: [dest] });   // silent locally
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType, ext,
                take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
@@ -2995,11 +3038,13 @@ function startExport(t, returnTo, isRetry) {
   recorder.onstop = () => deliverExport(ex);
 
   // Drive the shared playback machinery with the export flag set.
+  stopMusic();               // a live cue doesn't bleed into the file
   mode = "export";
   play.take = t;
   play.returnTo = ex.returnTo;
   play.active = true;
   play.exporting = true;
+  play.musicOuts = dest ? [dest] : null;   // music cues mix into the file, silently
   play.audio = audioEl;
   seekPlayback(0);
   play.playing = true;
@@ -3993,7 +4038,7 @@ function renderHelp(ctx) {
   drawText(ctx, "USE BY A CAR/UFO RIDES - BY PROPS KICKS", 48, y, SILVER); y += 9;
   drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 9;
   drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
-  drawText(ctx, "MUSIC = SONG EDITOR - FX TAB = WEATHER", 48, y, SILVER); y += 9;
+  drawText(ctx, "1-8 = CUE MUSIC LIVE, 0 = STOP THE MUSIC", 48, y, SILVER); y += 9;
   drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 9;
   drawText(ctx, "DEL REMOVES - H CLOSES THIS PANEL", 48, y, SILVER);
   uiBtn(40, 24, 240, 132, () => { helpOpen = false; });
@@ -4034,6 +4079,36 @@ function scrubTo(mx) {
   pausePlayback();
   seekPlayback(Math.round(f * play.take.duration));
   if (wasPlaying) resumePlayback();
+}
+
+/* ---- Music cue bar -------------------------------------------------------
+   Quick track cueing without leaving the performance: click a number (or
+   press keys 1-8; 0 stops) to start a song right now — hands stay free for
+   moving and talking. Cues are recorded as music events mid-take.          */
+function renderCueBar(ctx) {
+  const tracks = allTracks().slice(0, 8);
+  if (!tracks.length) return;
+  const y = (drawerOpen ? IH - DRAWER_H : IH) - 13;
+  const cur = music.playing ? music.playing.track : null;
+  let x = 2;
+  rect(ctx, 0, y, 30 + tracks.length * 11 + 26, 13, NIGHT);
+  drawText(ctx, "CUE", x + 1, y + 3, SILVER);
+  x += 18;
+  tracks.forEach((tr, i) => {
+    const on = cur && cur.id === tr.id;
+    panel(ctx, x, y + 1, 10, 11, on ? GREEN : DUSK, on ? LIME : SLATE);
+    drawTextC(ctx, String(i + 1), x + 5, y + 3, on ? WHITE : SILVER);
+    uiBtn(x, y + 1, 10, 11, ((t2, was) => () => cueMusic(was ? null : t2))(tr, on));
+    x += 11;
+  });
+  panel(ctx, x, y + 1, 14, 11, DUSK, cur ? RED : SLATE);
+  drawTextC(ctx, "0", x + 7, y + 3, cur ? RED : SLATE);
+  uiBtn(x, y + 1, 14, 11, () => cueMusic(null));
+  x += 17;
+  if (cur) {
+    rect(ctx, x, y + 1, textW(cur.name) + 6, 11, NIGHT);
+    drawText(ctx, cur.name, x + 3, y + 3, LIME);
+  }
 }
 
 /* ---- Toast -------------------------------------------------------------- */
@@ -4248,6 +4323,7 @@ function render(frameDt) {
     }
     renderTopBar(sctx, currentSpeaker());
     renderSelectionPanel(sctx);
+    renderCueBar(sctx);
     renderDrawer(sctx);
     renderTypedBubble(sctx);
     renderShowTitleInput(sctx);
@@ -4345,6 +4421,13 @@ function onKeyPressed(code) {
       const target = (selected && !selected.isProp && live.puppets.includes(selected)) ? selected
                    : live.puppets[0];
       if (target) openTypedBubble(target);
+    }
+    // music cue hotkeys: 1-8 start a track (same again stops), 0 stops
+    if (code === "Digit0") cueMusic(null);
+    const dm = /^Digit([1-8])$/.exec(code);
+    if (dm) {
+      const tr = allTracks()[Number(dm[1]) - 1];
+      if (tr) cueMusic(music.playing && music.playing.track.id === tr.id ? null : tr);
     }
   }
   if (code === "Escape") {
