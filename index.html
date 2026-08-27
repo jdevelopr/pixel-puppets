@@ -1143,6 +1143,60 @@ for (const b of BACKDROPS) {
 const STAGE_MINX = 10, STAGE_MAXX = IW - 10;
 const STAGE_MINY = 100, STAGE_MAXY = IH - 6;
 /* ============================================================================
+   WEATHER FX — procedural particle overlays (rain, snow, fireflies) drawn
+   above the scene. Positions are pure functions of a time value and a
+   per-particle hash, so live, playback, and export all reproduce the exact
+   same weather from the recorded {type:"weather", kind} events with no
+   particle state to store. All positions floored, palette colors only.
+   ==========================================================================*/
+
+const WEATHER_KINDS = ["none", "rain", "snow", "fireflies"];
+
+function whash(i, salt) {
+  const x = Math.sin(i * 127.1 + salt * 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+function drawWeather(ctx, kind, t) {
+  if (!kind || kind === "none") return;
+  if (kind === "rain") {
+    for (let i = 0; i < 70; i++) {
+      const speed = 0.22 + whash(i, 1) * 0.14;
+      const x = Math.floor((whash(i, 2) * IW * 1.2 - t * 0.05) % IW + IW) % IW;
+      const y = Math.floor((whash(i, 3) * IH + t * speed) % (IH + 24)) - 12;
+      rect(ctx, x, y, 1, 4, whash(i, 4) < 0.7 ? SKY : ICE);
+    }
+  } else if (kind === "snow") {
+    for (let i = 0; i < 55; i++) {
+      const speed = 0.035 + whash(i, 1) * 0.03;
+      const sway = Math.floor(Math.sin(t / 700 + i * 1.7) * 5);
+      const x = ((Math.floor(whash(i, 2) * IW) + sway) % IW + IW) % IW;
+      const y = Math.floor((whash(i, 3) * IH + t * speed) % (IH + 12)) - 6;
+      px(ctx, x, y, whash(i, 4) < 0.75 ? WHITE : SILVER);
+    }
+  } else if (kind === "fireflies") {
+    for (let i = 0; i < 16; i++) {
+      if (Math.sin(t / 380 + i * 2.9) < -0.15) continue;   // blink off
+      const x = Math.floor(whash(i, 1) * (IW - 30) + 15 + Math.sin(t / 1300 + i * 2.1) * 14);
+      const y = Math.floor(46 + whash(i, 2) * (IH - 84) + Math.sin(t / 900 + i * 1.3) * 9);
+      const c = (i % 3 === 0) ? SAND : LIME;
+      px(ctx, x, y, c);
+      if (Math.sin(t / 380 + i * 2.9) > 0.6) px(ctx, x + 1, y, c);   // brighter pulse
+    }
+  }
+}
+
+/* Scene-wipe transition: black blinds sweep closed then open over ~700ms,
+   covering the backdrop swap that lands mid-wipe. state.wipeT counts down. */
+function drawWipe(ctx, wipeT) {
+  if (!wipeT || wipeT <= 0) return;
+  const p = 1 - wipeT / 700;                       // 0 -> 1 over the wipe
+  const cover = p < 0.5 ? p * 2 : (1 - p) * 2;     // close, then open
+  const w = Math.floor(32 * cover);
+  if (w <= 0) return;
+  for (let x = 0; x < IW; x += 32) rect(ctx, x, 0, w, IH, NIGHT);
+}
+/* ============================================================================
    PUPPET — runtime instance of a character on stage.
 
    Character spec (what gets saved to JSON — ids and palette indices only):
@@ -1894,6 +1948,423 @@ const liveMouth = new MouthQuantizer();
 /* Fallback flap used when someone holds a talk key with no mic available. */
 function flapAmp(t) { return (Math.floor(t / 200) % 3 === 1) ? 0.12 : 0.05; }
 /* ============================================================================
+   SPEECH BUBBLES + AUTO-CAPTIONS
+
+   Two ways a bubble appears:
+   1. Typed: press T with a puppet selected, type a line, press ENTER.
+   2. Auto (CC): toggle the CC button to load a local Whisper model
+      (whisper-tiny running fully in-browser via transformers.js — audio
+      never leaves the machine). While a talk key is held, the mic PCM is
+      captured; on release the utterance is transcribed in the background
+      and becomes that puppet's bubble.
+   The model (~40MB) streams from the CDN on first use and is cached by the
+   browser after that. If it can't load (e.g. offline), CC shows ERR and
+   typed bubbles keep working — nothing else depends on it.
+
+   Bubbles are recorded as {type:"bubble", id, text, dur} timeline events
+   (auto-captions are back-dated to when the utterance STARTED), so playback
+   and export re-render them exactly. Because transcription finishes after
+   the words were said, late results are inserted into the take in time
+   order — never lost, even if they arrive after STOP REC.
+   ==========================================================================*/
+
+const speech = {
+  enabled: false,
+  status: "off",        // off | loading | ready | error
+  progress: 0,
+  asr: null,
+  node: null,           // ScriptProcessor tapping the mic
+  capturing: false,
+  chunks: [],           // Float32Array pieces of the current utterance
+  utterStart: 0,        // recNow() at utterance start (-1 if not recording)
+  utterWall: 0,         // performance.now() at utterance start
+  speakerId: null,
+  session: 0            // which recording session the utterance belongs to
+};
+let recSession = 0;     // bumped by startRecording
+
+function toggleSpeech() {
+  speech.enabled = !speech.enabled;
+  if (speech.enabled && !speech.asr && speech.status !== "loading") loadWhisper();
+  if (speech.enabled) requestMic();
+}
+
+async function loadWhisper() {
+  speech.status = "loading";
+  speech.progress = 0;
+  try {
+    const T = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1");
+    T.env.allowLocalModels = false;
+    speech.asr = await T.pipeline("automatic-speech-recognition", "onnx-community/whisper-tiny.en", {
+      dtype: "q8",
+      device: navigator.gpu ? "webgpu" : "wasm",
+      progress_callback: (p) => { if (p && p.progress) speech.progress = Math.min(99, Math.round(p.progress)); }
+    });
+    speech.status = "ready";
+    toast("AUTO-CAPTIONS READY - HOLD A TALK KEY AND SPEAK");
+  } catch (e) {
+    speech.status = "error";
+    speech.enabled = false;
+    toast("SPEECH MODEL UNAVAILABLE - PRESS T TO TYPE BUBBLES");
+  }
+}
+
+/* Tap the mic with a ScriptProcessor once it exists (called from update). */
+function ensureSpeechTap() {
+  if (speech.node || !mic.ok || !mic.stream || !mic.ctx) return;
+  const ctx = mic.ctx;
+  const src = ctx.createMediaStreamSource(mic.stream);
+  speech.node = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain();
+  mute.gain.value = 0;                       // keep the node running, silently
+  src.connect(speech.node);
+  speech.node.connect(mute);
+  mute.connect(ctx.destination);
+  speech.node.onaudioprocess = (e) => {
+    if (!speech.capturing) return;
+    speech.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    if (speech.chunks.length > 700) speech.capturing = false;   // ~1min cap
+  };
+}
+
+/* Track utterances: called every fixed step with the current live speaker. */
+function speechStep(speaker) {
+  if (!speech.enabled || speech.status !== "ready") return;
+  ensureSpeechTap();
+  if (speaker && !speech.capturing) {
+    speech.capturing = true;
+    speech.chunks = [];
+    speech.speakerId = speaker.id;
+    speech.utterStart = recording ? recNow() : -1;
+    speech.utterWall = performance.now();
+    speech.session = recSession;
+  } else if (!speaker && speech.capturing) {
+    speech.capturing = false;
+    finishUtterance();
+  }
+}
+
+function finishUtterance() {
+  const chunks = speech.chunks;
+  speech.chunks = [];
+  const sr = mic.ctx ? mic.ctx.sampleRate : 48000;
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const durMs = (n / sr) * 1000;
+  if (durMs < 350 || !speech.asr) return;
+  const pcm = new Float32Array(n);
+  let off = 0;
+  for (const c of chunks) { pcm.set(c, off); off += c.length; }
+  // linear resample to the 16kHz Whisper expects
+  const ratio = sr / 16000, outN = Math.floor(n / ratio);
+  const out = new Float32Array(outN);
+  for (let i = 0; i < outN; i++) {
+    const s = i * ratio, i0 = Math.floor(s), f = s - i0;
+    out[i] = pcm[i0] * (1 - f) + (pcm[Math.min(n - 1, i0 + 1)] || 0) * f;
+  }
+  const meta = { id: speech.speakerId, t: speech.utterStart, session: speech.session, durMs };
+  speech.asr(out).then((res) => {
+    let text = (res && res.text ? res.text : "").trim();
+    text = text.replace(/\s+/g, " ").toUpperCase();
+    if (!text || /^\[.*\]$/.test(text)) return;   // whisper noise markers
+    if (text.length > 90) text = text.slice(0, 87) + "...";
+    deliverBubble(meta, text);
+  }).catch(() => {});
+}
+
+/* Route a finished caption to the live stage and into the timeline. */
+function deliverBubble(meta, text) {
+  const showFor = Math.max(1600, Math.min(6000, meta.durMs + 900));
+  const ev = { t: Math.max(0, meta.t), type: "bubble", id: meta.id, text, dur: showFor };
+  if (recording && meta.session === recSession && meta.t >= 0) {
+    recording.events.push(ev);                    // sorted at stopRecording
+  } else if (take && meta.session === recSession && meta.t >= 0) {
+    insertEventSorted(take.events, ev);           // arrived after STOP REC
+  }
+  if (mode === "stage") liveBubble(meta.id, text, showFor);
+}
+function insertEventSorted(events, ev) {
+  let i = events.length;
+  while (i > 0 && events[i - 1].t > ev.t) i--;
+  events.splice(i, 0, ev);
+}
+
+/* ---- bubble display ----------------------------------------------------- */
+function liveBubble(id, text, dur) {
+  live.bubbles = live.bubbles.filter(b => b.id !== id);
+  live.bubbles.push({ id, text, until: performance.now() + dur });
+}
+
+/* Draw every active bubble in a state. `t` is that state's clock (wall time
+   live, take time in playback/export) — until values live in the same clock. */
+function drawBubbles(ctx, state, t) {
+  if (!state.bubbles) return;
+  state.bubbles = state.bubbles.filter(b => b.until > t);
+  for (const b of state.bubbles) {
+    const p = findEntity(state, b.id);
+    if (!p) continue;
+    // measure wrapped text (max ~100px wide)
+    const words = b.text.split(" ");
+    const lines = [];
+    let line = "";
+    for (const wd of words) {
+      const test = line ? line + " " + wd : wd;
+      if (textW(test) > 96 && line) { lines.push(line); line = wd; } else line = test;
+    }
+    if (line) lines.push(line);
+    let w = 0;
+    for (const l of lines) w = Math.max(w, textW(l));
+    const bw = w + 8, bh = lines.length * 8 + 5;
+    const bx = clamp(p.x - (bw >> 1), 2, IW - bw - 2);
+    const by = Math.max(2, (p.bbox && p.bbox.y ? p.bbox.y : p.y - 36) - bh - 5);
+    panel(ctx, bx, by, bw, bh, WHITE, NIGHT);
+    for (let i = 0; i < lines.length; i++) drawText(ctx, lines[i], bx + 4, by + 3 + i * 8, NIGHT);
+    // tail pointing at the puppet
+    const tx = clamp(p.x, bx + 3, bx + bw - 5);
+    rect(ctx, tx, by + bh, 2, 1, WHITE);
+    rect(ctx, tx, by + bh + 1, 1, 1, WHITE);
+    px(ctx, tx - 1, by + bh, NIGHT);
+    px(ctx, tx + 2, by + bh, NIGHT);
+  }
+}
+
+/* Typed bubbles (T key): tiny modal handled with the canvas text input. */
+const typedBubble = { active: false, text: "", target: null };
+function openTypedBubble(p) {
+  typedBubble.active = true;
+  typedBubble.text = "";
+  typedBubble.target = p;
+  textInput = {
+    tag: "bubble", max: 60,
+    get: () => typedBubble.text,
+    set: (v) => { typedBubble.text = v; },
+    onEnter: () => {
+      const text = typedBubble.text.trim();
+      typedBubble.active = false;
+      if (!text || !typedBubble.target) return;
+      const dur = Math.max(1800, Math.min(6000, 1200 + text.length * 55));
+      liveBubble(typedBubble.target.id, text, dur);
+      if (recording) recEvent({ type: "bubble", id: typedBubble.target.id, text, dur });
+    },
+    onCancel: () => { typedBubble.active = false; }
+  };
+}
+function renderTypedBubble(ctx) {
+  if (!typedBubble.active) return;
+  panel(ctx, 60, 60, 200, 30, NIGHT, ICE);
+  drawText(ctx, "SAY (ENTER TO SPEAK, ESC TO CANCEL):", 66, 64, SILVER);
+  rect(ctx, 66, 74, 188, 11, DUSK);
+  drawText(ctx, typedBubble.text + ((Math.floor(performance.now() / 400) % 2) ? "_" : ""), 69, 76, WHITE);
+}
+/* ============================================================================
+   CHIPTUNE MUSIC — a tiny WebAudio synth playing looping step-sequencer
+   tracks defined entirely as data (no audio files).
+
+   Track format:
+     { id, name, bpm, wave,          // wave: "square" | "triangle" melody voice
+       grid }                        // grid[row][step] booleans, 14 rows x 32
+   Rows 0-11 are melody notes on a two-octave C-major pentatonic scale
+   (top row = highest note, so tunes are always consonant); row 12 = kick
+   drum, row 13 = hi-hat. Steps are 16th notes.
+
+   The engine schedules oscillators ahead of time against the AudioContext
+   clock, so live shows, playback, and export all stay on the beat. The
+   whole synth routes through one gain bus, which is what the narration
+   "ducking" moves, and can be pointed at extra destinations (the export
+   mixer) on demand. Custom tracks persist to localStorage as JSON, and a
+   take embeds a full copy of its track so saved shows keep their music
+   even if the track is later edited or deleted.
+   ==========================================================================*/
+
+const MUSIC_ROWS = 14, MUSIC_STEPS = 32, ROW_KICK = 12, ROW_HAT = 13;
+/* Top-to-bottom midi notes for rows 0..11 (C-major pentatonic, D6 -> C4). */
+const NOTE_MIDI = [86, 84, 81, 79, 76, 74, 72, 69, 67, 64, 62, 60];
+const NOTE_NAMES = ["D6", "C6", "A5", "G5", "E5", "D5", "C5", "A4", "G4", "E4", "D4", "C4"];
+const midiHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+/* Build a grid from 14 pattern strings ('x' = note on, 32 chars each). */
+function gridFrom(rows) {
+  return rows.map(r => {
+    const out = [];
+    for (let s = 0; s < MUSIC_STEPS; s++) out.push(r[s] === "x");
+    return out;
+  });
+}
+function emptyGrid() {
+  return Array.from({ length: MUSIC_ROWS }, () => Array(MUSIC_STEPS).fill(false));
+}
+
+const BUILTIN_TRACKS = [
+  { id: "march", name: "PUPPET MARCH", bpm: 116, wave: "square", builtin: true, grid: gridFrom([
+    "................................",  // D6
+    "............x...............x...",  // C6
+    "..............x.........x......",  // A5
+    "........x.......x...............",  // G5
+    "....x.......................x...",  // E5
+    "..........x.............x......",  // D5
+    "x.......x.......x.......x.......",  // C5
+    "......x.......x.......x.........",  // A4
+    "..x.......x.......x.......x.....",  // G4
+    "................................",  // E4
+    "................................",  // D4
+    "................................",  // C4
+    "x...x...x...x...x...x...x...x...",  // KICK
+    "..x...x...x...x...x...x...x...x."   // HAT
+  ]) },
+  { id: "lullaby", name: "LULLABY", bpm: 72, wave: "triangle", builtin: true, grid: gridFrom([
+    "................................",
+    "........x.......................",
+    "............x...........x......",
+    "x...............x...............",
+    "....x...............x..........",
+    "......x.................x.......",
+    "..............x.......x.........",
+    "....................x...........",
+    "..........x.....................",
+    "................x...........x...",
+    "................................",
+    "............................x...",
+    "x...............x...............",
+    "........x...............x......."
+  ]) },
+  { id: "spooky", name: "SPOOKY WALK", bpm: 92, wave: "triangle", builtin: true, grid: gridFrom([
+    "................................",
+    "................................",
+    "................................",
+    "......x.........................",
+    "..........x...........x.........",
+    "................................",
+    "....x.......x.....x.............",
+    "................................",
+    "x.......x.......x.......x...x...",
+    "..x.........................x...",
+    "....................x...........",
+    "x...............x...............",
+    "x.......x.......x.......x.......",
+    "....x.......x.......x.....x.x..."
+  ]) },
+  { id: "chase", name: "THE CHASE", bpm: 150, wave: "square", builtin: true, grid: gridFrom([
+    "....x.......x.......x.......x...",
+    "................................",
+    "..x...x...x...x...x...x...x...x.",
+    "................................",
+    "x...x...x...x...x...x...x...x...",
+    "................................",
+    "......x.......x.......x.......x.",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.",
+    "x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x."
+  ]) }
+];
+
+/* ---- persistence -------------------------------------------------------- */
+let customTracks = [];
+let currentTrackId = null;    // track used for the next recorded show (null = none)
+const TRACKS_KEY = "pixelPuppetsTracks.v1";
+function saveTracks() {
+  if (!canStore) return;
+  try { window.localStorage.setItem(TRACKS_KEY, JSON.stringify({ tracks: customTracks, current: currentTrackId })); }
+  catch (e) {}
+}
+function loadTracks() {
+  if (!canStore) return;
+  try {
+    const raw = window.localStorage.getItem(TRACKS_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.tracks)) customTracks = data.tracks;
+    currentTrackId = data.current || null;
+  } catch (e) {}
+}
+function allTracks() { return BUILTIN_TRACKS.concat(customTracks); }
+function trackById(id) { for (const t of allTracks()) if (t.id === id) return t; return null; }
+function currentTrack() { return currentTrackId ? trackById(currentTrackId) : null; }
+
+/* ---- synth engine ------------------------------------------------------- */
+const music = { playing: null, noiseBuf: null };
+
+function noiseBuffer(ctx) {
+  if (music.noiseBuf) return music.noiseBuf;
+  const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.07), ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  music.noiseBuf = buf;
+  return buf;
+}
+
+function scheduleStep(ctx, bus, track, step, when, stepDur) {
+  const pat = step % MUSIC_STEPS;
+  for (let row = 0; row < MUSIC_ROWS; row++) {
+    if (!track.grid[row] || !track.grid[row][pat]) continue;
+    if (row === ROW_KICK) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(130, when);
+      o.frequency.exponentialRampToValueAtTime(42, when + 0.1);
+      g.gain.setValueAtTime(0.5, when);
+      g.gain.exponentialRampToValueAtTime(0.001, when + 0.12);
+      o.connect(g); g.connect(bus);
+      o.start(when); o.stop(when + 0.13);
+    } else if (row === ROW_HAT) {
+      const s = ctx.createBufferSource(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+      s.buffer = noiseBuffer(ctx);
+      f.type = "highpass"; f.frequency.value = 6000;
+      g.gain.setValueAtTime(0.14, when);
+      g.gain.exponentialRampToValueAtTime(0.001, when + 0.05);
+      s.connect(f); f.connect(g); g.connect(bus);
+      s.start(when); s.stop(when + 0.06);
+    } else {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = track.wave === "triangle" ? "triangle" : "square";
+      o.frequency.value = midiHz(NOTE_MIDI[row]);
+      const dur = Math.max(0.1, stepDur * 1.8);
+      g.gain.setValueAtTime(track.wave === "triangle" ? 0.2 : 0.12, when);
+      g.gain.exponentialRampToValueAtTime(0.001, when + dur);
+      o.connect(g); g.connect(bus);
+      o.start(when); o.stop(when + dur + 0.02);
+    }
+  }
+}
+
+/* Start a looping track. outs = AudioNodes to feed (defaults to speakers);
+   offsetMs starts mid-pattern so playback scrubbing stays in sync. */
+function playTrack(track, opts) {
+  stopMusic();
+  if (!track) return;
+  const ctx = audioCtx();
+  const outs = (opts && opts.outs) || [ctx.destination];
+  const bus = ctx.createGain();
+  bus.gain.value = 0.6;
+  for (const o of outs) bus.connect(o);
+  const stepDur = 60 / track.bpm / 4;
+  const startTime = ctx.currentTime + 0.06 - ((opts && opts.offsetMs) || 0) / 1000;
+  let nextStep = Math.max(0, Math.ceil((ctx.currentTime + 0.05 - startTime) / stepDur));
+  const timer = setInterval(() => {
+    if (!music.playing) return;
+    while (startTime + nextStep * stepDur < ctx.currentTime + 0.25) {
+      scheduleStep(ctx, bus, track, nextStep, Math.max(ctx.currentTime, startTime + nextStep * stepDur), stepDur);
+      nextStep++;
+    }
+  }, 90);
+  music.playing = { track, bus, timer, startTime, stepDur };
+}
+function stopMusic() {
+  if (!music.playing) return;
+  clearInterval(music.playing.timer);
+  try { music.playing.bus.disconnect(); } catch (e) {}
+  music.playing = null;
+}
+/* Narration ducking: pull the music down while somebody is talking. */
+function duckMusic(ducked) {
+  if (!music.playing) return;
+  const ctx = audioCtx();
+  music.playing.bus.gain.setTargetAtTime(ducked ? 0.22 : 0.6, ctx.currentTime, 0.08);
+}
+/* ============================================================================
    INPUT — three keyboard control schemes usable simultaneously on one
    keyboard, plus mouse handling. Key state lives in a held-keys set updated
    on keydown/keyup and is read once per fixed timestep; puppets are never
@@ -1914,8 +2385,13 @@ let textInput = null;            // {get,set,max} — routes typing when focused
 const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash", "Space", "Enter"]);
 
 window.addEventListener("keydown", (e) => {
-  if (textInput) {                       // builder name field has focus
-    if (e.key === "Enter" || e.key === "Escape") textInput = null;
+  if (textInput) {                       // a canvas text field has focus
+    if (e.key === "Enter" || e.key === "Escape") {
+      const ti = textInput;
+      textInput = null;
+      if (e.key === "Enter" && ti.onEnter) ti.onEnter();
+      if (e.key === "Escape" && ti.onCancel) ti.onCancel();
+    }
     else if (e.key === "Backspace") textInput.set(textInput.get().slice(0, -1));
     else if (e.key.length === 1 && (e.key in FONT) && textInput.get().length < textInput.max)
       textInput.set(textInput.get() + e.key);
@@ -2023,6 +2499,12 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
                                          open/rustle/nudge/flare) - replays
                                          the cosmetic burst only; the state
                                          change arrives via pos/remove events
+     bubble   {id, text, dur}            speech bubble (typed, or Whisper
+                                         auto-caption back-dated to when the
+                                         utterance started)
+     weather  {kind}                     weather overlay change
+     wipe     {}                         scene-wipe transition (the backdrop
+                                         event lands mid-wipe, ~350ms later)
    Props share the id space and the pos/layer/remove event types with
    puppets. Ability effects are transient eye-candy: they are re-spawned
    from ability events during playback, never stored as pixels.
@@ -2045,9 +2527,15 @@ function recNow() { return Math.round(performance.now() - recording.t0); }
 function recEvent(ev) { ev.t = recNow(); recording.events.push(ev); }
 
 function startRecording() {
+  recSession++;
   recording = { t0: performance.now(), events: [], amps: [], lastPos: new Map(), mediaRec: null, chunks: [] };
   // Snapshot initial state at t=0 so playback can reconstruct the stage.
   recording.events.push({ t: 0, type: "backdrop", index: live.backdrop });
+  recording.events.push({ t: 0, type: "weather", kind: live.weather });
+  // theme song: play it live under the take, aligned to t=0
+  const tr = currentTrack();
+  recording.trackData = tr ? JSON.parse(JSON.stringify(tr)) : null;
+  if (tr) playTrack(tr, {});
   for (const p of live.puppets) {
     recording.events.push({ t: 0, type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
     if (p.layerMode === "manual")
@@ -2098,12 +2586,17 @@ function recordSample(speakerId, amp) {
 function stopRecording() {
   const rec = recording;
   const duration = recNow();
+  stopMusic();
   // final position keyframe for everything so playback ends in place
   for (const p of [...live.puppets, ...live.props]) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
   const finalize = (audioBlob) => {
     if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
+    // async captions may have landed out of order — keep the timeline sorted
+    rec.events.sort((a, b) => a.t - b.t);
     take = {
       duration: Math.max(duration, 100),
+      title: "",
+      trackData: rec.trackData || null,
       events: rec.events,
       amps: rec.amps,
       audioBlob,
@@ -2157,6 +2650,9 @@ const play = {
   puppets: [],          // separate instances; the live stage is untouched
   props: [],
   effects: [],
+  bubbles: [],
+  weather: "none",
+  wipeT: 0,
   backdrop: 0,
   speakerId: -1,
   eventIdx: 0,
@@ -2193,10 +2689,13 @@ function resumePlayback() {
   play.playing = true;
   play.ended = false;
   if (play.audio) play.audio.play().catch(() => { play.audio = null; });
+  if (play.take.trackData && !play.exporting)
+    playTrack(play.take.trackData, { offsetMs: playbackClock() });
 }
 function pausePlayback() {
   play.playing = false;
   if (play.audio) play.audio.pause();
+  if (!play.exporting) stopMusic();
 }
 function exitPlayback() {
   pausePlayback();
@@ -2215,6 +2714,9 @@ function seekPlayback(t) {
   play.puppets = [];
   play.props = [];
   play.effects = [];      // transient effects don't survive a scrub — fine
+  play.bubbles = [];
+  play.weather = "none";
+  play.wipeT = 0;
   play.backdrop = live.backdrop;
   play.speakerId = -1;
   play.eventIdx = 0;
@@ -2282,6 +2784,13 @@ function applyEvent(ev) {
       if (p) p.vehicle = null;
       break;
     }
+    case "bubble": {
+      play.bubbles = play.bubbles.filter(b => b.id !== ev.id);
+      play.bubbles.push({ id: ev.id, text: ev.text, until: ev.t + ev.dur });
+      break;
+    }
+    case "weather": play.weather = ev.kind; break;
+    case "wipe": play.wipeT = 700; break;
   }
 }
 
@@ -2333,12 +2842,15 @@ function stepPlayback(dt) {
   const amp = currentAmp(t);
   const jaw = play.mouth.update(amp, dt);
   for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
+  duckMusic(jaw > 0);
+  if (play.wipeT > 0) play.wipeT -= dt;
   updateEffects(play, dt);
   if (t >= play.take.duration) {
     play.playing = false;
     play.ended = true;
     if (play.audio) play.audio.pause();
     if (play.exporting) finishExport();
+    else stopMusic();
   }
 }
 /* ============================================================================
@@ -2364,17 +2876,20 @@ function startExport(t, returnTo, isRetry) {
     return; // no MediaRecorder: export unavailable
   }
   const stream = cv.captureStream(30);
-  let audioEl = null;
+  let audioEl = null, dest = null;
+  if (t.audioURL || t.trackData) {
+    const ctx = audioCtx();
+    dest = ctx.createMediaStreamDestination();
+    for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
+  }
   if (t.audioURL) {
     // Fresh element each export: a MediaElementSource permanently claims its
     // element. Routed ONLY to the destination node, so exporting is silent.
     audioEl = new Audio(t.audioURL);
-    const ctx = audioCtx();
-    const src = ctx.createMediaElementSource(audioEl);
-    const dest = ctx.createMediaStreamDestination();
+    const src = audioCtx().createMediaElementSource(audioEl);
     src.connect(dest);
-    for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
   }
+  if (t.trackData) playTrack(t.trackData, { outs: [dest] });   // silent locally
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType,
                take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
@@ -2415,6 +2930,7 @@ function cancelExport() {
 
 function deliverExport(ex) {
   if (exporter === ex) exporter = null;
+  stopMusic();
   play.active = false;
   play.exporting = false;
   play.puppets = [];
@@ -2591,6 +3107,8 @@ function saveCurrentShow() {
   const d = new Date();
   const rec = {
     name: "",   // filled below once the id is known
+    title: take.title || "",
+    trackData: take.trackData || null,
     date: (d.getMonth() + 1) + "/" + d.getDate(),
     duration: take.duration,
     events: take.events,
@@ -2639,6 +3157,8 @@ function takeFromRecord(rec) {
   if (rec._take) return rec._take;
   rec._take = {
     duration: rec.duration,
+    title: rec.title || "",
+    trackData: rec.trackData || null,
     events: rec.events,
     amps: rec.amps,
     audioBlob: rec.audioBlob || null,
@@ -2798,10 +3318,174 @@ function renderBuilder(ctx, dt) {
   drawText(ctx, canStore ? "AUTO-SAVE ON" : "NO BROWSER STORAGE - USE EXPORT", 110, 150, SILVER);
 }
 /* ============================================================================
+   MUSIC STUDIO — a step-sequencer screen for the chiptune tracks. Pick a
+   track on the left, paint notes on the 32-step grid, preview it, and save.
+   Built-in tracks can be edited and saved as copies; custom tracks persist
+   to localStorage. "USE" marks the track that plays under the next show.
+   ==========================================================================*/
+
+const musicEd = {
+  track: null,        // working copy being edited
+  sourceId: null,     // id it was loaded from
+  previewing: false,
+  returnTo: "title"
+};
+
+function enterMusicEd() {
+  musicEd.returnTo = (mode === "stage") ? "stage" : "title";
+  mode = "music";
+  if (!musicEd.track) musicEdLoad(allTracks()[0].id);
+}
+function exitMusicEd() {
+  if (musicEd.previewing) { stopMusic(); musicEd.previewing = false; }
+  textInput = null;
+  mode = musicEd.returnTo;
+  if (mode === "title") enterTitle();
+}
+function musicEdLoad(id) {
+  const t = trackById(id);
+  musicEd.track = JSON.parse(JSON.stringify(t));
+  musicEd.sourceId = id;
+  if (musicEd.previewing) { stopMusic(); musicEd.previewing = false; }
+}
+function musicEdSave() {
+  const t = musicEd.track;
+  const src = trackById(musicEd.sourceId);
+  if (src && !src.builtin) {                    // overwrite the custom track
+    Object.assign(src, JSON.parse(JSON.stringify(t)), { builtin: false });
+  } else {                                      // save a new custom track
+    const id = "custom" + Date.now();
+    const copy = Object.assign(JSON.parse(JSON.stringify(t)), { id, builtin: false });
+    if (src && src.builtin && copy.name === src.name) copy.name = (copy.name + " 2").slice(0, 14);
+    customTracks.push(copy);
+    musicEd.sourceId = id;
+    musicEd.track.id = id;
+  }
+  saveTracks();
+  toast("TRACK SAVED");
+}
+
+const MG = { x0: 78, y0: 26, cw: 7, ch: 8 };    // grid layout
+
+function renderMusicEd(ctx) {
+  rect(ctx, 0, 0, IW, IH, NAVY);
+  rect(ctx, 0, 0, IW, 14, NIGHT);
+  drawTextC(ctx, "MUSIC STUDIO", IW / 2, 0, WHITE, 2);
+  panel(ctx, 2, 1, 32, 12, DUSK, SLATE);
+  drawText(ctx, "BACK", 7, 4, WHITE);
+  uiBtn(2, 1, 32, 12, () => exitMusicEd());
+  const t = musicEd.track;
+  if (!t) return;
+
+  // ---- track list (left) ----
+  let ly = 26;
+  drawText(ctx, "TRACKS", 4, 18, SILVER);
+  for (const tr of allTracks().slice(0, 9)) {
+    const sel = tr.id === musicEd.sourceId;
+    const used = tr.id === currentTrackId;
+    panel(ctx, 2, ly, 42, 11, sel ? NAVY : DUSK, sel ? ICE : SLATE);
+    drawText(ctx, tr.name.slice(0, 8), 4, ly + 2, sel ? WHITE : SILVER);
+    uiBtn(2, ly, 42, 11, ((id) => () => musicEdLoad(id))(tr.id));
+    panel(ctx, 45, ly, 12, 11, used ? GREEN : DUSK, used ? LIME : SLATE);
+    drawTextC(ctx, used ? "*" : "+", 51, ly + 2, used ? WHITE : SILVER);
+    uiBtn(45, ly, 12, 11, ((id, was) => () => {
+      currentTrackId = was ? null : id;
+      saveTracks();
+      toast(was ? "MUSIC OFF FOR NEXT SHOW" : "WILL PLAY UNDER THE NEXT SHOW");
+    })(tr.id, used));
+    ly += 12;
+  }
+  drawText(ctx, "* = PLAYS IN", 2, ly + 2, SILVER);
+  drawText(ctx, "NEXT SHOW", 2, ly + 10, SILVER);
+
+  // ---- step grid ----
+  for (let row = 0; row < MUSIC_ROWS; row++) {
+    const label = row === ROW_KICK ? "KCK" : row === ROW_HAT ? "HAT" : NOTE_NAMES[row];
+    drawText(ctx, label, MG.x0 - textW(label) - 3, MG.y0 + row * MG.ch + 1, row >= ROW_KICK ? ORANGE : SILVER);
+    for (let s = 0; s < MUSIC_STEPS; s++) {
+      const cx = MG.x0 + s * MG.cw, cy = MG.y0 + row * MG.ch;
+      const beat = (s % 8) < 1, bar = (s % 4) < 1;
+      const bg = t.grid[row][s] ? (row >= ROW_KICK ? ORANGE : SKY)
+                                : beat ? SLATE : bar ? DUSK : NIGHT;
+      rect(ctx, cx, cy, MG.cw - 1, MG.ch - 1, bg);
+    }
+  }
+  // playhead while previewing
+  if (musicEd.previewing && music.playing) {
+    const mp = music.playing;
+    const ctxNow = mic.ctx ? mic.ctx.currentTime : 0;
+    const s = Math.max(0, Math.floor((ctxNow - mp.startTime) / mp.stepDur)) % MUSIC_STEPS;
+    frameRect(ctx, MG.x0 + s * MG.cw - 1, MG.y0 - 1, MG.cw + 1, MUSIC_ROWS * MG.ch + 1, WHITE);
+  }
+  uiBtn(MG.x0, MG.y0, MUSIC_STEPS * MG.cw, MUSIC_ROWS * MG.ch, (mx2, my2) => {
+    const s = Math.floor((mx2 - MG.x0) / MG.cw), row = Math.floor((my2 - MG.y0) / MG.ch);
+    if (s >= 0 && s < MUSIC_STEPS && row >= 0 && row < MUSIC_ROWS) {
+      t.grid[row][s] = !t.grid[row][s];
+      if (musicEd.previewing) { playTrack(t, {}); }   // restart with the edit
+    }
+  });
+
+  // ---- controls ----
+  const cy = MG.y0 + MUSIC_ROWS * MG.ch + 6;
+  const nameFocused = textInput && textInput.tag === "trackname";
+  panel(ctx, MG.x0, cy, 80, 12, nameFocused ? SLATE : DUSK, nameFocused ? ICE : SILVER);
+  drawText(ctx, t.name + (nameFocused && (Math.floor(performance.now() / 400) % 2) ? "_" : ""), MG.x0 + 3, cy + 3, WHITE);
+  uiBtn(MG.x0, cy, 80, 12, () => {
+    textInput = { tag: "trackname", max: 14, get: () => t.name, set: (v) => { t.name = v; } };
+  });
+  let bx = MG.x0 + 84;
+  const btns = [
+    [musicEd.previewing ? "STOP" : "PLAY", () => {
+      if (musicEd.previewing) { stopMusic(); musicEd.previewing = false; }
+      else { audioCtx(); playTrack(t, {}); musicEd.previewing = true; }
+    }],
+    ["BPM-", () => { t.bpm = Math.max(50, t.bpm - 4); if (musicEd.previewing) playTrack(t, {}); }],
+    [String(t.bpm), () => {}],
+    ["BPM+", () => { t.bpm = Math.min(200, t.bpm + 4); if (musicEd.previewing) playTrack(t, {}); }],
+    [t.wave === "triangle" ? "SOFT" : "CHIP", () => { t.wave = t.wave === "triangle" ? "square" : "triangle"; if (musicEd.previewing) playTrack(t, {}); }]
+  ];
+  for (const [label, cb] of btns) {
+    const w = textW(label) + 6;
+    panel(ctx, bx, cy, w, 12, DUSK, SLATE);
+    drawText(ctx, label, bx + 3, cy + 3, WHITE);
+    uiBtn(bx, cy, w, 12, cb);
+    bx += w + 3;
+  }
+  // second control row
+  const cy2 = cy + 15;
+  bx = MG.x0;
+  const src = trackById(musicEd.sourceId);
+  const row2 = [
+    [src && src.builtin ? "SAVE AS COPY" : "SAVE", () => musicEdSave()],
+    ["NEW", () => {
+      musicEd.track = { id: "new", name: "MY SONG", bpm: 110, wave: "square", grid: emptyGrid() };
+      musicEd.sourceId = null;
+      if (musicEd.previewing) { stopMusic(); musicEd.previewing = false; }
+    }],
+    ["CLEAR", () => { t.grid = emptyGrid(); if (musicEd.previewing) playTrack(t, {}); }]
+  ];
+  if (src && !src.builtin) row2.push(["DELETE", () => {
+    customTracks = customTracks.filter(c => c.id !== src.id);
+    if (currentTrackId === src.id) currentTrackId = null;
+    saveTracks();
+    musicEdLoad(allTracks()[0].id);
+    toast("TRACK DELETED");
+  }]);
+  for (const [label, cb] of row2) {
+    const w = textW(label) + 6;
+    panel(ctx, bx, cy2, w, 12, NIGHT, SILVER);
+    drawText(ctx, label, bx + 3, cy2 + 3, WHITE);
+    uiBtn(bx, cy2, w, 12, cb);
+    bx += w + 4;
+  }
+  drawText(ctx, "CLICK THE GRID TO PAINT NOTES", bx + 4, cy2 + 3, SILVER);
+}
+/* ============================================================================
    STAGE — live scene rendering, drawer, selection UI, transport, overlays.
    ==========================================================================*/
 
-const live = { puppets: [], props: [], effects: [], backdrop: 0 };
+const live = { puppets: [], props: [], effects: [], bubbles: [], weather: "none",
+               wipeT: 0, pendingBackdrop: null, backdrop: 0 };
 let selected = null;
 let drawerOpen = true;
 let drawerTab = "cast";   // "cast" | "props"
@@ -2845,6 +3529,16 @@ function setLayer(p, mode2, z) {
   p.layerMode = mode2; p.manualZ = z || 0;
   if (recording) recEvent({ type: "layer", id: p.id, mode: mode2, z: p.manualZ });
 }
+function setWeather(kind) {
+  live.weather = kind;
+  if (recording) recEvent({ type: "weather", kind });
+}
+/* SCENE+ during recording: wipe transition with the backdrop swap mid-wipe. */
+function sceneWipe(nextIdx) {
+  live.wipeT = 700;
+  if (recording) recEvent({ type: "wipe" });
+  live.pendingBackdrop = { at: performance.now() + 350, idx: nextIdx };
+}
 
 /* Resolve who is speaking right now (live): held talk modifier of an assigned
    scheme wins (most recent press first); otherwise a dragged puppet; else nobody. */
@@ -2866,6 +3560,10 @@ function renderScene(ctx, state, opts) {
     else if (!p.vehicle) drawPuppet(ctx, p, opts);   // drivers drawn by vehicle
   }
   if (state.effects) drawEffects(ctx, state);
+  const now = opts.time !== undefined ? opts.time : performance.now();
+  drawWeather(ctx, state.weather, now);
+  drawBubbles(ctx, state, now);
+  drawWipe(ctx, state.wipeT);
   if (!opts.clean) {
     for (const p of sorted) {
       if (p.scheme) {   // controller badge, hidden during playback/export
@@ -2894,14 +3592,14 @@ function renderDrawer(ctx) {
     return;
   }
   panel(ctx, 0, y0, IW, DRAWER_H, NIGHT, SILVER);
-  // tabs: puppet roster / props+vehicles
-  for (const [tab, label, tx] of [["cast", "PUPPETS", 4], ["props", "PROPS", 52]]) {
+  // tabs: puppet roster / props+vehicles / weather fx
+  for (const [tab, label, tx, tw] of [["cast", "PUPPETS", 4, 44], ["props", "PROPS", 50, 40], ["fx", "FX", 92, 22]]) {
     const on = drawerTab === tab;
-    panel(ctx, tx, y0, 44, 10, on ? NAVY : NIGHT, on ? ICE : SLATE);
-    drawTextC(ctx, label, tx + 22, y0 + 2, on ? WHITE : SILVER);
-    uiBtn(tx, y0, 44, 10, () => { drawerTab = tab; });
+    panel(ctx, tx, y0, tw, 10, on ? NAVY : NIGHT, on ? ICE : SLATE);
+    drawTextC(ctx, label, tx + tw / 2, y0 + 2, on ? WHITE : SILVER);
+    uiBtn(tx, y0, tw, 10, () => { drawerTab = tab; });
   }
-  drawText(ctx, "CLICK TO ADD", 102, y0 + 2, SILVER);
+  drawText(ctx, "CLICK TO ADD", 122, y0 + 2, SILVER);
   panel(ctx, IW - 34, y0, 34, 10, DUSK, SILVER);
   drawText(ctx, "HIDE", IW - 28, y0 + 2, WHITE);
   uiBtn(IW - 34, y0, 34, 10, () => { drawerOpen = false; });
@@ -2935,6 +3633,19 @@ function renderDrawer(ctx) {
       panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
       drawTextC(ctx, "NEW", x + 13, cy + 26, WHITE);
     }
+  } else if (drawerTab === "fx") {
+    // weather buttons — take effect immediately and record as events
+    drawText(ctx, "WEATHER", 6, cy + 2, SILVER);
+    let wx = 6;
+    for (const [kind, label] of [["none", "CLEAR"], ["rain", "RAIN"], ["snow", "SNOW"], ["fireflies", "FIREFLIES"]]) {
+      const on = live.weather === kind;
+      const w = textW(label) + 8;
+      panel(ctx, wx, cy + 10, w, 13, on ? NAVY : DUSK, on ? ICE : SLATE);
+      drawText(ctx, label, wx + 4, cy + 13, on ? WHITE : SILVER);
+      uiBtn(wx, cy + 10, w, 13, ((k) => () => { setWeather(k); })(kind));
+      wx += w + 4;
+    }
+    drawText(ctx, "SCENE+ (TOP BAR) WIPES SCENES WHILE REC", 6, cy + 26, SILVER);
   } else {
     // props + vehicles
     for (const def of PROP_DEFS) {
@@ -3020,30 +3731,50 @@ function renderSelectionPanel(ctx) {
 }
 
 /* ---- Top bar ------------------------------------------------------------ */
+function ccLabel() {
+  if (!speech.enabled && speech.status !== "loading") return "CC:OFF";
+  if (speech.status === "loading") return "CC " + speech.progress + "%";
+  if (speech.status === "ready") return "CC:ON";
+  return "CC:ERR";
+}
+
+function barRow(ctx, items, y) {
+  let x = 2;
+  for (const [label, cb, col] of items) {
+    const w = textW(label) + 6;
+    panel(ctx, x, y, w, 12, DUSK, col !== undefined ? col : SLATE);
+    drawText(ctx, label, x + 3, y + 3, col !== undefined ? col : WHITE);
+    uiBtn(x, y, w, 12, cb);
+    x += w + 3;
+  }
+  return x;
+}
+
 function renderTopBar(ctx, speaker) {
   rect(ctx, 0, 0, IW, 14, NIGHT);
-  let x = 2;
-  const bar = [];
+  const row1 = [];
   if (!recording) {
-    bar.push(["MENU", () => enterTitle()]);
-    bar.push(["BUILD", () => enterBuilder(-1)]);
-    bar.push(["REC", () => { requestMic(); startRecording(); toast(mic.ok ? "RECORDING!" : "RECORDING (NO MIC - SILENT TAKE)"); }, RED]);
-    if (take) {
-      bar.push(["PLAY", () => enterPlayback(take, "stage"), LIME]);
-      bar.push(["EXPORT", () => startExport(take, "stage"), SKY]);
-      if (!take.saved) bar.push(["SAVE SHOW", () => saveCurrentShow(), SAND]);
-      bar.push(["DISCARD", () => { discardTake(); toast("TAKE DISCARDED"); }]);
-    }
+    row1.push(["MENU", () => enterTitle()]);
+    row1.push(["BUILD", () => enterBuilder(-1)]);
+    row1.push(["MUSIC", () => enterMusicEd()]);
+    row1.push(["REC", () => { requestMic(); startRecording(); toast(mic.ok ? "RECORDING!" : "RECORDING (NO MIC - SILENT TAKE)"); }, RED]);
   } else {
-    bar.push(["STOP REC", () => { stopRecording(); toast("TAKE READY - PRESS PLAY"); }, RED]);
+    row1.push(["STOP REC", () => { stopRecording(); toast("TAKE READY - PRESS PLAY"); }, RED]);
+    row1.push(["SCENE+", () => sceneWipe((live.backdrop + 1) % BACKDROPS.length), ICE]);
   }
-  bar.push(["HELP (H)", () => { helpOpen = !helpOpen; }]);
-  for (const [label, cb, col] of bar) {
-    const w = textW(label) + 6;
-    panel(ctx, x, 1, w, 12, DUSK, col !== undefined ? col : SLATE);
-    drawText(ctx, label, x + 3, 4, col !== undefined ? col : WHITE);
-    uiBtn(x, 1, w, 12, cb);
-    x += w + 3;
+  row1.push([ccLabel(), () => toggleSpeech(), speech.status === "ready" && speech.enabled ? LIME : SILVER]);
+  row1.push(["?", () => { helpOpen = !helpOpen; }]);
+  barRow(ctx, row1, 1);
+  // second row: take controls
+  if (take && !recording) {
+    rect(ctx, 0, 14, IW, 14, NIGHT);
+    barRow(ctx, [
+      ["PLAY", () => enterPlayback(take, "stage"), LIME],
+      ["EXPORT", () => startExport(take, "stage"), SKY],
+      ["TITLE", () => openShowTitle(), SAND],
+      !take.saved ? ["SAVE", () => saveCurrentShow(), SAND] : ["SAVED", () => {}, SLATE],
+      ["DISCARD", () => { discardTake(); toast("TAKE DISCARDED"); }]
+    ], 15);
   }
   // status, right-aligned
   if (recording) {
@@ -3052,17 +3783,68 @@ function renderTopBar(ctx, speaker) {
     if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - textW(label) - 14, 4, 6, 6, RED);
     drawTextR(ctx, label, IW - 4, 4, RED);
     frameRect(ctx, 0, 0, IW, IH, RED);
-  } else if (take) {
-    drawTextR(ctx, "TAKE " + fmtTime(take.duration) + " READY", IW - 4, 4, LIME);
   } else if (!mic.ok && mic.requested) {
     drawTextR(ctx, "NO MIC", IW - 4, 4, SILVER);
   }
   // current speaker indicator
   if (speaker) {
+    const y = take && !recording ? 30 : 16;
     const label = "TALKING: " + speaker.spec.name;
-    rect(ctx, 2, 16, textW(label) + 6, 9, NIGHT);
-    drawText(ctx, label, 5, 17, SAND);
+    rect(ctx, 2, y, textW(label) + 6, 9, NIGHT);
+    drawText(ctx, label, 5, y + 1, SAND);
   }
+}
+
+/* ---- show title input ---------------------------------------------------- */
+const showTitle = { active: false, text: "" };
+function openShowTitle() {
+  if (!take) return;
+  showTitle.active = true;
+  showTitle.text = take.title || "";
+  textInput = {
+    tag: "showtitle", max: 24,
+    get: () => showTitle.text,
+    set: (v) => { showTitle.text = v; },
+    onEnter: () => { showTitle.active = false; take.title = showTitle.text.trim(); take.saved = false; toast("TITLE SET"); },
+    onCancel: () => { showTitle.active = false; }
+  };
+}
+function renderShowTitleInput(ctx) {
+  if (!showTitle.active) return;
+  panel(ctx, 60, 60, 200, 32, NIGHT, SAND);
+  drawText(ctx, "SHOW TITLE (ENTER TO SET):", 66, 64, SILVER);
+  rect(ctx, 66, 74, 188, 12, DUSK);
+  drawText(ctx, showTitle.text + ((Math.floor(performance.now() / 400) % 2) ? "_" : ""), 69, 77, WHITE);
+}
+
+/* ---- curtain + title card (playback and export only) --------------------
+   The show starts behind a closing-to-opening theater curtain carrying the
+   title card, and the curtain sweeps shut over the final moments.          */
+function drawShowIntro(ctx, t, tk) {
+  const D = tk.duration;
+  const closeF = t > D - 700 ? clamp((t - (D - 700)) / 650, 0, 1) : 0;
+  const openF = clamp((t - 500) / 900, 0, 1);
+  const cover = Math.max(1 - openF, closeF);        // closed at start and end
+  const half = Math.floor((IW / 2) * cover);
+  if (half > 0) {
+    for (const [x0, dir] of [[0, 1], [IW - half, -1]]) {
+      rect(ctx, x0, 0, half, IH, RED);
+      for (let i = 4; i < half; i += 8) rect(ctx, dir > 0 ? half - i : IW - half + i, 0, 3, IH, PLUM);
+    }
+  }
+  if (half >= IW / 2 - 2 || t < 1600) {   // valance while mostly closed
+    rect(ctx, 0, 0, IW, 10, RED);
+    for (let x = 0; x < IW; x += 16) rect(ctx, x + 5, 10, 6, 3, RED);
+    rect(ctx, 0, 0, IW, 2, SAND);
+  }
+  if (t < 1600) {                          // title card
+    const title = (tk.title && tk.title.length) ? tk.title : "A PIXEL PUPPETS SHOW";
+    drawTextC(ctx, title, IW / 2 + 1, 61, NIGHT, 2);
+    drawTextC(ctx, title, IW / 2, 60, SAND, 2);
+    drawTextC(ctx, "* PIXEL PUPPETS PRESENTS *", IW / 2, 46, WHITE);
+    if (tk.trackData) drawTextC(ctx, "MUSIC: " + tk.trackData.name, IW / 2, 82, ICE);
+  }
+  if (closeF >= 1) drawTextC(ctx, "THE END", IW / 2, 82, SAND, 2);
 }
 
 function fmtTime(ms) {
@@ -3088,12 +3870,12 @@ function renderHelp(ctx) {
     y += 12;
   }
   y += 4;
-  drawText(ctx, "USE FIRES YOUR ITEM - STAFF, BOW, SWORD...", 48, y, SILVER); y += 10;
-  drawText(ctx, "USE NEXT TO A CAR OR UFO HOPS IN / OUT", 48, y, SILVER); y += 10;
-  drawText(ctx, "USE NEXT TO PROPS: KICK BALLS, SMASH CRATES", 48, y, SILVER); y += 10;
-  drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 10;
-  drawText(ctx, "DRAG PUPPETS AND PROPS WITH THE MOUSE", 48, y, SILVER); y += 10;
-  drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 10;
+  drawText(ctx, "USE FIRES YOUR ITEM - STAFF, BOW, SWORD...", 48, y, SILVER); y += 9;
+  drawText(ctx, "USE BY A CAR/UFO RIDES - BY PROPS KICKS", 48, y, SILVER); y += 9;
+  drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 9;
+  drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
+  drawText(ctx, "MUSIC = SONG EDITOR - FX TAB = WEATHER", 48, y, SILVER); y += 9;
+  drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 9;
   drawText(ctx, "DEL REMOVES - H CLOSES THIS PANEL", 48, y, SILVER);
   uiBtn(40, 24, 240, 132, () => { helpOpen = false; });
 }
@@ -3181,18 +3963,19 @@ function renderTitle(ctx) {
   const items = [
     ["NEW SHOW", () => { mode = "stage"; }],
     ["SHOW LIBRARY (" + showLib.length + ")", () => { refreshShowLib(); mode = "library"; }],
-    ["CHARACTER BUILDER", () => enterBuilder(-1)]
+    ["CHARACTER BUILDER", () => enterBuilder(-1)],
+    ["MUSIC STUDIO", () => enterMusicEd()]
   ];
-  let y = 66;
+  let y = 58;
   for (const [label, cb] of items) {
     const w = 130;
     const x = (IW - w) >> 1;
-    panel(ctx, x, y, w, 16, NIGHT, SAND);
-    drawTextC(ctx, label, IW / 2, y + 5, WHITE);
-    uiBtn(x, y, w, 16, cb);
-    y += 20;
+    panel(ctx, x, y, w, 15, NIGHT, SAND);
+    drawTextC(ctx, label, IW / 2, y + 4, WHITE);
+    uiBtn(x, y, w, 15, cb);
+    y += 18;
   }
-  drawTextC(ctx, "UP TO 3 PLAYERS ON ONE KEYBOARD", IW / 2, 128, SILVER);
+  drawTextC(ctx, "UP TO 3 PLAYERS ON ONE KEYBOARD", IW / 2, 133, SILVER);
 }
 
 /* ---- Library ------------------------------------------------------------ */
@@ -3218,10 +4001,11 @@ function renderLibrary(ctx) {
   for (let i = libScroll; i < Math.min(showLib.length, libScroll + LIB_ROWS); i++) {
     const rec = showLib[i];
     panel(ctx, 10, y, 300, 20, DUSK, SLATE);
-    drawText(ctx, rec.name, 16, y + 6, SAND);
-    drawText(ctx, fmtTime(rec.duration), 78, y + 6, WHITE);
-    drawText(ctx, rec.date, 112, y + 6, SILVER);
-    drawText(ctx, rec.audioBlob ? "VOICE" : "SILENT", 146, y + 6, rec.audioBlob ? ICE : SLATE);
+    drawText(ctx, (rec.title && rec.title.length ? rec.title : rec.name).slice(0, 14), 16, y + 6, SAND);
+    drawText(ctx, fmtTime(rec.duration), 108, y + 6, WHITE);
+    drawText(ctx, rec.date, 134, y + 6, SILVER);
+    drawText(ctx, rec.trackData ? "M" : "", 162, y + 6, LIME);
+    drawText(ctx, rec.audioBlob ? "V" : "", 172, y + 6, ICE);
     const btns = [
       ["PLAY", LIME, () => enterPlayback(takeFromRecord(rec), "library")],
       ["EXPORT", SKY, () => startExport(takeFromRecord(rec), "library")],
@@ -3309,6 +4093,13 @@ function update(dt) {
     const jaw = liveMouth.update(amp, dt);
     for (const p of live.puppets) p.jaw = (p === speaker) ? jaw : 0;
     if (recording) recordSample(speaker ? speaker.id : -1, amp);
+    speechStep(speaker);                       // auto-caption utterances
+    duckMusic(jaw > 0);                        // narration over the theme song
+    if (live.wipeT > 0) live.wipeT -= dt;
+    if (live.pendingBackdrop && performance.now() >= live.pendingBackdrop.at) {
+      setBackdrop(live.pendingBackdrop.idx);   // lands mid-wipe
+      live.pendingBackdrop = null;
+    }
   } else if (mode === "playback" || mode === "export") {
     stepPlayback(dt);
   } else if (mode === "title") {
@@ -3329,6 +4120,9 @@ function render(frameDt) {
   } else if (mode === "builder") {
     renderBuilder(sctx, frameDt);
     renderToast(sctx);
+  } else if (mode === "music") {
+    renderMusicEd(sctx);
+    renderToast(sctx);
   } else if (mode === "stage") {
     renderScene(sctx, live, { clean: false });
     if (live.puppets.length === 0 && !recording) {
@@ -3337,13 +4131,17 @@ function render(frameDt) {
     renderTopBar(sctx, currentSpeaker());
     renderSelectionPanel(sctx);
     renderDrawer(sctx);
+    renderTypedBubble(sctx);
+    renderShowTitleInput(sctx);
     renderToast(sctx);
     if (helpOpen) renderHelp(sctx);
   } else if (mode === "playback") {
-    renderScene(sctx, play, { clean: true });
+    renderScene(sctx, play, { clean: true, time: playbackClock() });
+    drawShowIntro(sctx, playbackClock(), play.take);
     renderTransport(sctx);
   } else if (mode === "export") {
-    renderScene(sctx, play, { clean: true });
+    renderScene(sctx, play, { clean: true, time: playbackClock() });
+    drawShowIntro(sctx, playbackClock(), play.take);   // curtain IS in the video
     captureExportFrame();                       // export gets the clean frame
     // progress overlay only on the visible screen, never in the file
     const t = clamp(playbackClock(), 0, play.take.duration);
@@ -3366,7 +4164,8 @@ function onMouseDown(x, y) {
     hitUI(x, y);                  // ...unless the click re-focuses it
     return;
   }
-  if (mode === "title" || mode === "library" || mode === "playback" || mode === "export") {
+  if (mode === "title" || mode === "library" || mode === "playback" || mode === "export" || mode === "music") {
+    if (mode === "music") textInput = null;   // clicking blurs the name field
     hitUI(x, y);
     return;
   }
@@ -3424,11 +4223,17 @@ function onKeyPressed(code) {
                    : (selected && !selected.isProp && live.puppets.includes(selected)) ? selected : null;
       if (target) useAction(target);
     }
+    if (code === "KeyT") {
+      const target = (selected && !selected.isProp && live.puppets.includes(selected)) ? selected
+                   : live.puppets[0];
+      if (target) openTypedBubble(target);
+    }
   }
   if (code === "Escape") {
     if (helpOpen) helpOpen = false;
     else if (mode === "builder") exitBuilder();
     else if (mode === "playback") exitPlayback();
+    else if (mode === "music") exitMusicEd();
     else if (mode === "library") mode = "title";
     else selected = null;
   }
@@ -3441,6 +4246,7 @@ function onKeyPressed(code) {
 
 /* ---- boot + loop -------------------------------------------------------- */
 loadRoster();
+loadTracks();
 initShowStore();
 enterTitle();
 
