@@ -1547,9 +1547,10 @@ const PROP_DEFS = [
     vehicle: { seatDx: -9, seatDy: 2, accX: 0.22, topX: 2.3, accY: 0.1, topY: 0.8 },
     frames: [CAR_TOP.concat(CAR_WHEELS_A), CAR_TOP.concat(CAR_WHEELS_B)] },
   { id: "ufo", name: "UFO", ox: -18, oy: -21, fms: 220,
-    vehicle: { seatDx: 0, seatDy: 9, accX: 0.18, topX: 2.0, accY: 0.18, topY: 1.5 },
+    // minY lets the UFO fly high into the sky, far above the walking band
+    vehicle: { seatDx: 0, seatDy: 9, accX: 0.18, topX: 2.0, accY: 0.18, topY: 1.5, minY: 38 },
     frames: [ufoFrame(0), ufoFrame(1)] },
-  { id: "crate", name: "CRATE", ox: -7, oy: -13, fms: 999, frames: [[
+  { id: "crate", name: "CRATE", ox: -7, oy: -13, fms: 999, hp: 2, frames: [[
     "00000000000000",
     "03333333333330",
     "03033333333030",
@@ -1633,6 +1634,10 @@ class Prop {
     this.isProp = true;
     this.animT = Math.random() * 999;
     this.wheelPhase = 0;                                // advanced by distance
+    this.wobbleT = 0;                                   // >0: shaking (interaction)
+    this.kinetic = false;                               // ball in flight (live only)
+    this.groundY = y;
+    this.hp = this.def.hp;                              // crate takes 2 kicks
     this.bbox = { x: 0, y: 0, w: 0, h: 0 };
   }
   get x() { return Math.floor(this.fx); }
@@ -1663,8 +1668,9 @@ function drawProp(ctx, v, state, opts) {
   if (v.isVehicle && v.propId === "car") idx = Math.floor(v.wheelPhase) % v.sprites.length;
   else if (def.fms < 999) idx = Math.floor(v.animT / def.fms) % v.sprites.length;
   const hover = (v.propId === "ufo") ? (Math.floor(v.animT / 400) % 2) : 0;
+  const wob = v.wobbleT > 0 ? ((Math.floor(v.wobbleT / 50) % 2) ? 1 : -1) : 0;
   const s = v.sprites[idx];
-  const r = blitPart(ctx, s, v.x, v.y + hover, def.ox, def.oy, v.facing);
+  const r = blitPart(ctx, s, v.x + wob, v.y + hover, def.ox, def.oy, v.facing);
   // compose bbox over prop + driver so selection/hit-testing covers both
   if (driver && driver.bbox.w) {
     const b0 = Math.min(r.x, driver.bbox.x), b1 = Math.max(r.x + r.w, driver.bbox.x + driver.bbox.w);
@@ -1714,8 +1720,104 @@ function driveVehicle(v, sc) {
   if (ix > 0) v.facing = 1; else if (ix < 0) v.facing = -1;
   const px0 = v.fx;
   v.fx = clamp(v.fx + v.vx, STAGE_MINX, STAGE_MAXX);
-  v.fy = clamp(v.fy + v.vy, STAGE_MINY, STAGE_MAXY);
+  v.fy = clamp(v.fy + v.vy, entityMinY(v), STAGE_MAXY);
   v.wheelPhase += Math.abs(v.fx - px0) * 0.25;
+}
+
+/* Vertical ceiling for an entity: flying vehicles may pass the walking limit. */
+function entityMinY(p) {
+  if (p.isProp && p.def.vehicle && p.def.vehicle.minY !== undefined) return p.def.vehicle.minY;
+  return STAGE_MINY;
+}
+
+/* ---- prop interactions --------------------------------------------------
+   Pressing USE right next to a (non-vehicle) prop interacts with it:
+   kick the ball, break the crate, open the chest, rustle the bush, nudge
+   the rock, stoke the campfire. The STATE change (ball physics, nudges,
+   removal) happens live and reaches playback through the ordinary pos /
+   remove keyframes; the recorded {type:"interact", id, pid, result} event
+   only re-spawns the matching COSMETIC effect, so live and playback can
+   never drift apart. */
+
+function propNear(state, p) {
+  let best = null, bd = 1e9;
+  for (const v of state.props) {
+    if (v.isVehicle) continue;
+    const dx = Math.abs(p.x - v.x), dy = Math.abs(p.y - v.y);
+    if (dx < 16 && dy < 13 && dx + dy < bd) { best = v; bd = dx + dy; }
+  }
+  return best;
+}
+
+/* Cosmetic burst for an interaction — shared by live and playback. */
+function propFX(state, v, result) {
+  const burst = (n, colors, vyLo, vyHi, g) => {
+    for (let i = 0; i < n; i++)
+      state.effects.push({ t: "px", x: v.x - 5 + Math.floor(Math.random() * 11), y: v.y - 6 - Math.floor(Math.random() * 6),
+        vx: (Math.random() - 0.5) * 1.6, vy: vyLo + Math.random() * (vyHi - vyLo), g,
+        ttl: 500 + Math.random() * 400, ci: colors[Math.floor(Math.random() * colors.length)] });
+  };
+  switch (result) {
+    case "kick":   addPoof(state, v.x, v.y - 4); break;
+    case "wobble": v.wobbleT = 380; addPoof(state, v.x, v.y - 8); break;
+    case "break":  burst(18, [ORANGE, NIGHT, SAND], -1.6, -0.2, 0.09); break;
+    case "open":   v.wobbleT = 300; burst(14, [SAND, SAND, WHITE], -2.0, -0.8, 0.08); break;
+    case "rustle": v.wobbleT = 380; burst(10, [LIME, GREEN], -0.9, -0.1, 0.05); break;
+    case "nudge":  v.wobbleT = 250; addPoof(state, v.x, v.y - 2); break;
+    case "flare":  burst(12, [ORANGE, RED, SAND], -1.4, -0.6, 0); break;
+  }
+}
+
+/* Live interaction: mutate state, fire the effect, record the event. */
+function interactProp(p, v) {
+  let result = null;
+  switch (v.propId) {
+    case "ball":
+      v.kinetic = true;
+      v.groundY = Math.min(v.fy, STAGE_MAXY);
+      v.vx = p.facing * 2.3;
+      v.vy = -1.9;
+      result = "kick";
+      break;
+    case "crate":
+      v.hp -= 1;
+      result = v.hp <= 0 ? "break" : "wobble";
+      break;
+    case "chest": result = "open"; break;
+    case "bush":  result = "rustle"; break;
+    case "rock":
+      v.fx = clamp(v.fx + p.facing * 3, STAGE_MINX, STAGE_MAXX);
+      result = "nudge";
+      break;
+    case "fire":  result = "flare"; break;
+  }
+  if (!result) return false;
+  p.useT = 260;
+  propFX(live, v, result);
+  if (recording) recEvent({ type: "interact", id: p.id, pid: v.id, result });
+  if (result === "break") removePuppet(v);   // records the remove event too
+  return true;
+}
+
+/* Ball flight, run once per fixed step on the LIVE stage only — playback
+   gets the same arc back from the recorded position keyframes. */
+function updateKineticProps(dt) {
+  for (const v of live.props) {
+    if (!v.kinetic) continue;
+    v.fx += v.vx;
+    v.fy += v.vy;
+    v.vy += 0.12;                                   // gravity
+    if (v.fx <= STAGE_MINX || v.fx >= STAGE_MAXX) { // wall bounce
+      v.fx = clamp(v.fx, STAGE_MINX, STAGE_MAXX);
+      v.vx = -v.vx * 0.7;
+    }
+    if (v.fy >= v.groundY) {                        // floor bounce
+      v.fy = v.groundY;
+      v.vy = -v.vy * 0.55;
+      v.vx *= 0.85;
+      if (Math.abs(v.vy) < 0.35) { v.kinetic = false; v.vx = 0; v.vy = 0; }
+    }
+  }
 }
 /* ============================================================================
    MICROPHONE + MOUTH
@@ -1917,6 +2019,10 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
      ability  {id}                       puppet fired its held item's ability
      board    {id, vid}                  puppet climbed into vehicle `vid`
      unboard  {id}                       puppet climbed out again
+     interact {id, pid, result}          puppet used prop `pid` (kick/break/
+                                         open/rustle/nudge/flare) - replays
+                                         the cosmetic burst only; the state
+                                         change arrives via pos/remove events
    Props share the id space and the pos/layer/remove event types with
    puppets. Ability effects are transient eye-candy: they are re-spawned
    from ability events during playback, never stored as pixels.
@@ -2157,6 +2263,15 @@ function applyEvent(ev) {
       if (p) spawnAbility(play, p);
       break;
     }
+    case "interact": {
+      // cosmetic only: state changes (ball arcs, nudges, removals) replay
+      // through pos keyframes and remove events
+      const v = findEntity(play, ev.pid);
+      const p = findPlayPuppet(ev.id);
+      if (p) p.useT = 260;
+      if (v) propFX(play, v, ev.result);
+      break;
+    }
     case "board": {
       const p = findPlayPuppet(ev.id);
       if (p) p.vehicle = ev.vid;
@@ -2187,7 +2302,7 @@ function updatePlaybackPositions(t, dt) {
     const dx = nx - p.fx;
     if (dx > 0.05) p.facing = 1; else if (dx < -0.05) p.facing = -1;
     p.setPos(nx, ny);
-    if (p.isProp) { p.animT += dt; p.wheelPhase += Math.abs(dx) * 0.25; }
+    if (p.isProp) { p.animT += dt; p.wheelPhase += Math.abs(dx) * 0.25; if (p.wobbleT > 0) p.wobbleT -= dt; }
     else p.animate(dt, p.vehicle ? 0 : dx);   // no walk cycle while riding
   }
   // a boarded puppet's facing follows its vehicle
@@ -2975,6 +3090,7 @@ function renderHelp(ctx) {
   y += 4;
   drawText(ctx, "USE FIRES YOUR ITEM - STAFF, BOW, SWORD...", 48, y, SILVER); y += 10;
   drawText(ctx, "USE NEXT TO A CAR OR UFO HOPS IN / OUT", 48, y, SILVER); y += 10;
+  drawText(ctx, "USE NEXT TO PROPS: KICK BALLS, SMASH CRATES", 48, y, SILVER); y += 10;
   drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 10;
   drawText(ctx, "DRAG PUPPETS AND PROPS WITH THE MOUSE", 48, y, SILVER); y += 10;
   drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 10;
@@ -3158,7 +3274,7 @@ function update(dt) {
     if (dragging) {
       dragging.p.vx = 0; dragging.p.vy = 0;
       dragging.p.fx = clamp(mouse.x - dragging.dx, STAGE_MINX, STAGE_MAXX);
-      dragging.p.fy = clamp(mouse.y - dragging.dy, STAGE_MINY, STAGE_MAXY);
+      dragging.p.fy = clamp(mouse.y - dragging.dy, entityMinY(dragging.p), STAGE_MAXY);
     }
     // riders follow their vehicles
     for (const p of live.puppets) {
@@ -3166,11 +3282,14 @@ function update(dt) {
       const v = findEntity(live, p.vehicle);
       if (v) { p.fx = v.fx; p.fy = v.fy; p.facing = v.facing; }
     }
-    // props: animation timers + wheel roll when dragged
+    // props: animation timers, wheel roll when dragged, kicked-ball physics
+    updateKineticProps(dt);
     for (const v of live.props) {
       v.animT += dt;
+      if (v.wobbleT > 0) v.wobbleT -= dt;
       const dvx = v.fx - (v._pfx !== undefined ? v._pfx : v.fx);
       if (dragging && dragging.p === v) v.wheelPhase += Math.abs(dvx) * 0.25;
+      if (dragging && dragging.p === v) v.kinetic = false;   // grabbing stops a ball
       v._pfx = v.fx;
     }
     // walk cycles from actual movement (drag or keys — same path)
@@ -3279,6 +3398,8 @@ function useAction(p) {
   if (p.vehicle) { unboardVehicle(live, p); return; }
   const v = vehicleNear(live, p);
   if (v) { boardVehicle(p, v); return; }
+  const w = propNear(live, p);                 // kick / break / open / rustle...
+  if (w && interactProp(p, w)) return;
   if (spawnAbility(live, p) && recording) recEvent({ type: "ability", id: p.id });
 }
 function onMouseMove(x, y) {
