@@ -1961,11 +1961,13 @@ function flapAmp(t) { return (Math.floor(t / 200) % 3 === 1) ? 0.12 : 0.05; }
    browser after that. If it can't load (e.g. offline), CC shows ERR and
    typed bubbles keep working — nothing else depends on it.
 
-   Bubbles are recorded as {type:"bubble", id, text, dur} timeline events
-   (auto-captions are back-dated to when the utterance STARTED), so playback
-   and export re-render them exactly. Because transcription finishes after
-   the words were said, late results are inserted into the take in time
-   order — never lost, even if they arrive after STOP REC.
+   Bubbles are recorded as {type:"bubble", id, text, dur} timeline events.
+   Transcription is slow, so live captions appear a beat after the words —
+   but the recorded event is BACK-DATED to the detected VOICE ONSET inside
+   the captured audio (not just the key press), so in playback and export
+   the bubble pops up exactly when the person starts talking, and stays up
+   for as long as they actually spoke. Late results are inserted into the
+   take in time order — never lost, even if they arrive after STOP REC.
    ==========================================================================*/
 
 const speech = {
@@ -2044,25 +2046,58 @@ function speechStep(speaker) {
   }
 }
 
+/* Find where the person actually starts and stops talking inside a captured
+   utterance: RMS over 20ms windows against an adaptive noise threshold.
+   Returns {startMs, endMs} of the voiced span, or null for pure silence. */
+function voiceSpan(pcm, sr) {
+  const win = Math.max(1, Math.floor(sr * 0.02));
+  const nw = Math.floor(pcm.length / win);
+  if (nw < 2) return null;
+  const rms = new Array(nw);
+  let peak = 0;
+  for (let w = 0; w < nw; w++) {
+    let s = 0;
+    for (let i = w * win; i < (w + 1) * win; i++) s += pcm[i] * pcm[i];
+    rms[w] = Math.sqrt(s / win);
+    if (rms[w] > peak) peak = rms[w];
+  }
+  const thr = Math.max(0.012, peak * 0.18);
+  let first = -1, last = -1;
+  for (let w = 0; w < nw; w++) if (rms[w] >= thr) { if (first < 0) first = w; last = w; }
+  if (first < 0) return null;
+  return { startMs: first * 20, endMs: (last + 1) * 20 };
+}
+
 function finishUtterance() {
   const chunks = speech.chunks;
   speech.chunks = [];
   const sr = mic.ctx ? mic.ctx.sampleRate : 48000;
   let n = 0;
   for (const c of chunks) n += c.length;
-  const durMs = (n / sr) * 1000;
-  if (durMs < 350 || !speech.asr) return;
+  if ((n / sr) * 1000 < 350 || !speech.asr) return;
   const pcm = new Float32Array(n);
   let off = 0;
   for (const c of chunks) { pcm.set(c, off); off += c.length; }
+  // anchor the caption to when speech actually begins, not the key press,
+  // and clip the silence off both ends before transcribing
+  const span = voiceSpan(pcm, sr);
+  if (!span || span.endMs - span.startMs < 250) return;   // held key, said nothing
+  const s0 = Math.max(0, Math.floor(((span.startMs - 120) / 1000) * sr));
+  const s1 = Math.min(n, Math.ceil(((span.endMs + 200) / 1000) * sr));
+  const clip = pcm.subarray(s0, s1);
   // linear resample to the 16kHz Whisper expects
-  const ratio = sr / 16000, outN = Math.floor(n / ratio);
+  const ratio = sr / 16000, outN = Math.floor(clip.length / ratio);
   const out = new Float32Array(outN);
   for (let i = 0; i < outN; i++) {
     const s = i * ratio, i0 = Math.floor(s), f = s - i0;
-    out[i] = pcm[i0] * (1 - f) + (pcm[Math.min(n - 1, i0 + 1)] || 0) * f;
+    out[i] = clip[i0] * (1 - f) + (clip[Math.min(clip.length - 1, i0 + 1)] || 0) * f;
   }
-  const meta = { id: speech.speakerId, t: speech.utterStart, session: speech.session, durMs };
+  const meta = {
+    id: speech.speakerId,
+    t: speech.utterStart >= 0 ? speech.utterStart + span.startMs : -1,
+    session: speech.session,
+    durMs: span.endMs - span.startMs
+  };
   speech.asr(out).then((res) => {
     let text = (res && res.text ? res.text : "").trim();
     text = text.replace(/\s+/g, " ").toUpperCase();
