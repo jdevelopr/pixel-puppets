@@ -956,11 +956,160 @@ function paintSchool(c) {
   }
 }
 
+function paintBeach(c) {
+  const r = RNG(33);
+  rect(c, 0, 0, IW, 62, SKY);
+  // sun with rays
+  rect(c, 24, 10, 16, 16, SAND); rect(c, 28, 6, 8, 24, SAND); rect(c, 20, 14, 24, 8, SAND);
+  for (const [x, y, w] of [[110, 14, 34], [220, 26, 40], [60, 34, 26]]) {
+    rect(c, x, y, w, 7, WHITE); rect(c, x + 5, y - 3, w - 10, 3, WHITE);
+  }
+  // ocean
+  rect(c, 0, 62, IW, 34, BLUE);
+  for (let y = 66; y < 96; y += 6)
+    for (let x = (y % 12) ? 6 : 0; x < IW; x += 24) rect(c, x, y, 10, 1, ICE);
+  // sailboat
+  rect(c, 236, 58, 22, 4, DUSK);
+  rect(c, 246, 38, 2, 20, DUSK);
+  for (let i = 0; i < 14; i++) rect(c, 248, 38 + i, Math.min(i, 12), 1, WHITE);
+  // sand
+  rect(c, 0, 96, IW, IH - 96, SAND);
+  rect(c, 0, 96, IW, 2, WHITE);
+  for (let i = 0; i < 140; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), ORANGE);
+  for (let i = 0; i < 16; i++) px(c, Math.floor(r() * IW), 104 + Math.floor(r() * 70), WHITE);
+  // palm tree
+  for (let i = 0; i < 26; i++) rect(c, 284 + (i >> 3), 96 - i, 5, 1, ORANGE);
+  rect(c, 285, 92, 3, 4, DUSK);
+  for (const [dx, dy, w] of [[-16, -4, 18], [2, -4, 18], [-12, -8, 14], [0, -8, 14], [-6, -12, 12]])
+    rect(c, 287 + dx, 70 + dy, w, 3, GREEN);
+  rect(c, 283, 74, 3, 3, RED);   // coconut
+  // beach ball on the sand
+  rect(c, 40, 108, 8, 8, WHITE); rect(c, 40, 108, 4, 4, RED); rect(c, 44, 112, 4, 4, RED);
+  frameRect(c, 40, 108, 8, 8, DUSK);
+}
+
+function paintCity(c) {
+  const r = RNG(64);
+  rect(c, 0, 0, IW, 96, NAVY);
+  rect(c, 262, 10, 14, 14, WHITE); rect(c, 266, 14, 4, 4, SILVER);   // moon
+  for (let i = 0; i < 26; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 50), WHITE);
+  // far skyline
+  for (let x = 0, i = 0; x < IW; i++) {
+    const w = 26 + Math.floor(r() * 22), h = 30 + Math.floor(r() * 26);
+    rect(c, x, 96 - h, w, h, SLATE);
+    for (let wy = 96 - h + 4; wy < 90; wy += 7)
+      for (let wx = x + 3; wx < x + w - 4; wx += 7)
+        if (r() < 0.4) rect(c, wx, wy, 3, 4, SAND);
+    x += w + 4;
+  }
+  // near buildings, left and right
+  for (const [x, w, h, col] of [[0, 52, 66, DUSK], [270, 50, 74, DUSK]]) {
+    rect(c, x, 96 - h, w, h, col);
+    rect(c, x, 96 - h, w, 2, NIGHT);
+    for (let wy = 96 - h + 6; wy < 90; wy += 9)
+      for (let wx = x + 4; wx < x + w - 5; wx += 9)
+        rect(c, wx, wy, 4, 5, r() < 0.55 ? SAND : NIGHT);
+  }
+  // street
+  rect(c, 0, 96, IW, IH - 96, DUSK);
+  rect(c, 0, 96, IW, 8, SILVER);              // sidewalk
+  rect(c, 0, 103, IW, 1, NIGHT);
+  for (let x = 0; x < IW; x += 20) rect(c, x, 96, 1, 7, SLATE);
+  for (let x = 4; x < IW; x += 28) rect(c, x, 140, 14, 3, SAND);   // lane dashes
+  // street lamps
+  for (const x of [70, 240]) {
+    rect(c, x, 52, 3, 44, SLATE);
+    rect(c, x - 3, 48, 9, 5, SAND);
+    rect(c, x - 1, 46, 5, 2, SLATE);
+  }
+}
+
+function paintTheater(c) {
+  // back wall with a dark arch, for depth
+  rect(c, 0, 0, IW, IH, PLUM);
+  for (let y = 8; y < 90; y += 12)
+    for (let x = 8 + ((y / 12) % 2) * 8; x < IW; x += 16) px(c, x, y, DUSK);
+  rect(c, 96, 20, 128, 76, NIGHT);
+  rect(c, 100, 24, 120, 72, DUSK);
+  // painted stars and a moon on the backcloth
+  for (const [sx, sy] of [[112, 32], [140, 44], [170, 30], [196, 50], [206, 34], [126, 60], [184, 66]]) {
+    px(c, sx, sy, SAND); px(c, sx - 1, sy, DUSK); px(c, sx + 1, sy, SAND); px(c, sx, sy - 1, SAND); px(c, sx, sy + 1, SAND);
+  }
+  rect(c, 150, 70, 10, 10, SAND); rect(c, 148, 68, 8, 8, DUSK);
+  // stage floor
+  rect(c, 0, 96, IW, IH - 96, ORANGE);
+  rect(c, 0, 96, IW, 2, SAND);
+  for (let y = 104; y < IH; y += 12) rect(c, 0, y, IW, 1, DUSK);
+  for (let x = 0; x < IW; x += 40) rect(c, x, 98, 1, IH - 98, DUSK);
+  // footlights
+  for (let x = 8; x < IW; x += 24) { rect(c, x, IH - 5, 8, 3, SAND); rect(c, x, IH - 2, 8, 2, DUSK); }
+  // side curtains with fold stripes
+  for (const [x0, dir] of [[0, 1], [IW - 44, -1]]) {
+    rect(c, x0, 0, 44, 150, RED);
+    for (let i = 6; i < 44; i += 8) rect(c, x0 + (dir > 0 ? i : 44 - i - 3), 0, 3, 146, PLUM);
+    rect(c, x0, 146, 44, 8, RED);
+    rect(c, x0, 150, 44, 2, PLUM);
+    rect(c, x0 + (dir > 0 ? 30 : 2), 60, 12, 8, SAND);   // tieback
+  }
+  // valance across the top
+  rect(c, 0, 0, IW, 12, RED);
+  for (let x = 0; x < IW; x += 16) rect(c, x + 4, 12, 8, 4, RED);
+  for (let x = 0; x < IW; x += 16) rect(c, x + 6, 16, 4, 2, SAND);
+  rect(c, 0, 0, IW, 2, SAND);
+}
+
+function paintGraveyard(c) {
+  const r = RNG(13);
+  rect(c, 0, 0, IW, 96, NIGHT);
+  for (let i = 0; i < 20; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 60), SILVER);
+  // moon with craters
+  rect(c, 48, 12, 22, 22, WHITE);
+  rect(c, 54, 18, 4, 4, SILVER); rect(c, 62, 26, 3, 3, SILVER);
+  // drifting cloud streaks (ragged, two offset layers each)
+  for (const [cx2, cy2, w] of [[90, 20, 60], [200, 34, 70], [30, 44, 50]]) {
+    rect(c, cx2, cy2, w, 2, DUSK);
+    rect(c, cx2 + 8, cy2 + 2, w - 20, 1, DUSK);
+    rect(c, cx2 - 6, cy2 + 1, 10, 1, DUSK);
+  }
+  // bats
+  for (const [x, y] of [[140, 24], [170, 16], [210, 30]]) {
+    rect(c, x, y, 3, 1, PLUM); rect(c, x - 3, y - 1, 3, 1, PLUM); rect(c, x + 3, y - 1, 3, 1, PLUM);
+  }
+  // hills
+  rect(c, 0, 80, IW, 16, DUSK);
+  for (let x = 0; x < IW; x += 10) rect(c, x, 76 + ((x / 10) % 2) * 2, 10, 6, DUSK);
+  // dead tree
+  rect(c, 250, 40, 5, 56, DUSK);
+  rect(c, 236, 46, 16, 3, DUSK); rect(c, 236, 38, 3, 10, DUSK);
+  rect(c, 255, 52, 20, 3, DUSK); rect(c, 272, 42, 3, 12, DUSK);
+  // iron fence along the horizon
+  rect(c, 0, 90, IW, 1, SLATE);
+  for (let x = 4; x < IW; x += 8) rect(c, x, 84, 2, 12, SLATE);
+  // gravestones just past the fence
+  for (const x of [24, 96, 150, 208, 288]) {
+    rect(c, x, 84, 12, 12, SILVER);
+    rect(c, x + 2, 82, 8, 2, SILVER);
+    rect(c, x + 3, 88, 6, 1, SLATE); rect(c, x + 4, 91, 4, 1, SLATE);
+  }
+  // ground
+  rect(c, 0, 96, IW, IH - 96, DUSK);
+  rect(c, 0, 96, IW, 1, PLUM);
+  for (let i = 0; i < 90; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), PLUM);
+  for (let i = 0; i < 24; i++) {
+    const gx = Math.floor(r() * IW), gy = 102 + Math.floor(r() * 72);
+    rect(c, gx, gy, 1, 2, LIME);   // eerie grass tufts
+  }
+}
+
 const BACKDROPS = [
   { id: "castle", name: "CASTLE", paint: paintCastle },
   { id: "forest", name: "FOREST", paint: paintForest },
   { id: "ship",   name: "SPACESHIP", paint: paintSpaceship },
-  { id: "school", name: "SCHOOL", paint: paintSchool }
+  { id: "school", name: "SCHOOL", paint: paintSchool },
+  { id: "beach",  name: "BEACH", paint: paintBeach },
+  { id: "city",   name: "CITY", paint: paintCity },
+  { id: "theater", name: "THEATER", paint: paintTheater },
+  { id: "grave",  name: "GRAVEYARD", paint: paintGraveyard }
 ];
 for (const b of BACKDROPS) {
   const [cv, cx] = makeCanvas(IW, IH);
@@ -1443,6 +1592,8 @@ function discardTake() {
 const play = {
   active: false,
   exporting: false,
+  take: null,           // the take being replayed (current or from the library)
+  returnTo: "stage",    // where STOP goes back to: "stage" | "library"
   t: 0,
   playing: false,
   puppets: [],          // separate instances; the live stage is untouched
@@ -1463,20 +1614,22 @@ function playbackClock() {
   return play.t;
 }
 
-function enterPlayback() {
-  if (!take) return;
+function enterPlayback(t, returnTo) {
+  if (!t) return;
   mode = "playback";
+  play.take = t;
+  play.returnTo = returnTo || "stage";
   play.active = true;
   play.exporting = false;
-  if (take.audioURL) {
-    play.audio = new Audio(take.audioURL);
+  if (t.audioURL) {
+    play.audio = new Audio(t.audioURL);
   } else play.audio = null;
   seekPlayback(0);
   resumePlayback();
 }
 
 function resumePlayback() {
-  if (play.ended || playbackClock() >= take.duration - 1) seekPlayback(0);
+  if (play.ended || playbackClock() >= play.take.duration - 1) seekPlayback(0);
   play.playing = true;
   play.ended = false;
   if (play.audio) play.audio.play().catch(() => { play.audio = null; });
@@ -1490,13 +1643,13 @@ function exitPlayback() {
   play.active = false;
   play.puppets = [];
   play.audio = null;
-  mode = "stage";
+  mode = play.returnTo || "stage";
 }
 
 /* Rebuild playback state at time t by re-applying events from the start.
    Event counts are small (sparse sampling), so a scrub re-scan is cheap. */
 function seekPlayback(t) {
-  t = clamp(t, 0, take.duration);
+  t = clamp(t, 0, play.take.duration);
   play.puppets = [];
   play.backdrop = live.backdrop;
   play.speakerId = -1;
@@ -1505,8 +1658,8 @@ function seekPlayback(t) {
   play.mouth.reset();
   play.t = t;
   play.ended = false;
-  while (play.eventIdx < take.events.length && take.events[play.eventIdx].t <= t)
-    applyEvent(take.events[play.eventIdx++]);
+  while (play.eventIdx < play.take.events.length && play.take.events[play.eventIdx].t <= t)
+    applyEvent(play.take.events[play.eventIdx++]);
   updatePlaybackPositions(t, 0);
   if (play.audio) { try { play.audio.currentTime = t / 1000; } catch (e) {} }
 }
@@ -1543,7 +1696,7 @@ function applyEvent(ev) {
    and feed the deltas into the same walk-cycle logic used live. */
 function updatePlaybackPositions(t, dt) {
   for (const p of play.puppets) {
-    const kf = take.keyframes.get(p.id);
+    const kf = play.take.keyframes.get(p.id);
     if (!kf || !kf.length) continue;
     let a = kf[0], b = kf[kf.length - 1];
     for (let i = 0; i < kf.length; i++) {
@@ -1561,7 +1714,7 @@ function updatePlaybackPositions(t, dt) {
 }
 
 function currentAmp(t) {
-  const amps = take.amps;
+  const amps = play.take.amps;
   if (!amps.length) return 0;
   while (play.ampIdx < amps.length - 1 && amps[play.ampIdx + 1][0] <= t) play.ampIdx++;
   while (play.ampIdx > 0 && amps[play.ampIdx][0] > t) play.ampIdx--;
@@ -1574,13 +1727,13 @@ function stepPlayback(dt) {
   if (!play.audio || play.audio.ended) play.t += dt;
   else play.t = play.audio.currentTime * 1000;   // stay synced for takeover
   const t = playbackClock();
-  while (play.eventIdx < take.events.length && take.events[play.eventIdx].t <= t)
-    applyEvent(take.events[play.eventIdx++]);
+  while (play.eventIdx < play.take.events.length && play.take.events[play.eventIdx].t <= t)
+    applyEvent(play.take.events[play.eventIdx++]);
   updatePlaybackPositions(t, dt);
   const amp = currentAmp(t);
   const jaw = play.mouth.update(amp, dt);
   for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
-  if (t >= take.duration) {
+  if (t >= play.take.duration) {
     play.playing = false;
     play.ended = true;
     if (play.audio) play.audio.pause();
@@ -1599,8 +1752,8 @@ function stepPlayback(dt) {
 const EXPORT_SCALE = 4;
 let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType}
 
-function startExport() {
-  if (!take || exporter) return;
+function startExport(t, returnTo, isRetry) {
+  if (!t || exporter) return;
   const [cv, cx] = makeCanvas(IW * EXPORT_SCALE, IH * EXPORT_SCALE);
   let mimeType = "";
   if (window.MediaRecorder) {
@@ -1611,10 +1764,10 @@ function startExport() {
   }
   const stream = cv.captureStream(30);
   let audioEl = null;
-  if (take.audioURL) {
+  if (t.audioURL) {
     // Fresh element each export: a MediaElementSource permanently claims its
     // element. Routed ONLY to the destination node, so exporting is silent.
-    audioEl = new Audio(take.audioURL);
+    audioEl = new Audio(t.audioURL);
     const ctx = audioCtx();
     const src = ctx.createMediaElementSource(audioEl);
     const dest = ctx.createMediaStreamDestination();
@@ -1622,13 +1775,16 @@ function startExport() {
     for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
   }
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType };
+  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType,
+               take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
   exporter = ex;
   recorder.ondataavailable = (e) => { if (e.data.size) ex.chunks.push(e.data); };
   recorder.onstop = () => deliverExport(ex);
 
   // Drive the shared playback machinery with the export flag set.
   mode = "export";
+  play.take = t;
+  play.returnTo = ex.returnTo;
   play.active = true;
   play.exporting = true;
   play.audio = audioEl;
@@ -1662,8 +1818,15 @@ function deliverExport(ex) {
   play.exporting = false;
   play.puppets = [];
   play.audio = null;
-  mode = "stage";
-  if (!ex || ex.canceled || !ex.chunks.length) return;
+  mode = (ex && ex.returnTo) || "stage";
+  if (!ex || ex.canceled) return;
+  if (!ex.chunks.length) {
+    // The very first canvas encoder in a session can come up empty on some
+    // machines; one automatic retry is almost always enough.
+    if (!ex.isRetry) { toast("EXPORT HICCUP - RETRYING..."); startExport(ex.take, ex.returnTo, true); }
+    else toast("EXPORT FAILED - PLEASE TRY AGAIN");
+    return;
+  }
   const blob = new Blob(ex.chunks, { type: ex.mimeType || "video/webm" });
   const url = URL.createObjectURL(blob);
   // download puppet-show.webm
@@ -1789,6 +1952,102 @@ function importRosterFile() {
   input.click();
 }
 /* ============================================================================
+   SHOW LIBRARY — saved shows persist in IndexedDB (which stores the narration
+   audio Blob natively alongside the timeline JSON). If IndexedDB is missing
+   or blocked, the library falls back cleanly to in-memory for the session.
+   A stored show record:
+     { id, name, date, duration, events, amps, audioBlob }
+   ==========================================================================*/
+
+const showStore = { db: null, mem: [], nextMemId: 1 };
+let showLib = [];              // cache of records for the library screen
+
+function initShowStore() {
+  try {
+    if (!window.indexedDB) return refreshShowLib();
+    const rq = indexedDB.open("pixelPuppetsShows", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("shows", { keyPath: "id", autoIncrement: true });
+    rq.onsuccess = () => { showStore.db = rq.result; refreshShowLib(); };
+    rq.onerror = () => refreshShowLib();
+  } catch (e) { refreshShowLib(); }
+}
+
+function refreshShowLib(then) {
+  if (!showStore.db) {
+    showLib = showStore.mem.slice().reverse();
+    if (then) then();
+    return;
+  }
+  try {
+    const rq = showStore.db.transaction("shows", "readonly").objectStore("shows").getAll();
+    rq.onsuccess = () => { showLib = (rq.result || []).reverse(); if (then) then(); };
+    rq.onerror = () => { showLib = []; if (then) then(); };
+  } catch (e) { showLib = []; if (then) then(); }
+}
+
+function saveCurrentShow() {
+  if (!take || take.saved) return;
+  const d = new Date();
+  const rec = {
+    name: "",   // filled below once the id is known
+    date: (d.getMonth() + 1) + "/" + d.getDate(),
+    duration: take.duration,
+    events: take.events,
+    amps: take.amps,
+    audioBlob: take.audioBlob
+  };
+  take.saved = true;
+  if (showStore.db) {
+    try {
+      const store = showStore.db.transaction("shows", "readwrite").objectStore("shows");
+      const rq = store.add(rec);
+      rq.onsuccess = () => {
+        rec.id = rq.result;
+        rec.name = "SHOW " + rec.id;
+        // write the record back with its generated name
+        showStore.db.transaction("shows", "readwrite").objectStore("shows").put(rec);
+        refreshShowLib();
+        toast("SAVED TO LIBRARY AS " + rec.name);
+      };
+      rq.onerror = () => { take.saved = false; toast("COULD NOT SAVE SHOW"); };
+      return;
+    } catch (e) { /* fall through to memory */ }
+  }
+  rec.id = showStore.nextMemId++;
+  rec.name = "SHOW " + rec.id;
+  showStore.mem.push(rec);
+  refreshShowLib();
+  toast("SAVED (THIS SESSION ONLY - NO STORAGE)");
+}
+
+function deleteShowFromLib(id) {
+  if (showStore.db) {
+    try {
+      const rq = showStore.db.transaction("shows", "readwrite").objectStore("shows").delete(id);
+      rq.onsuccess = () => refreshShowLib();
+      return;
+    } catch (e) { /* fall through */ }
+  }
+  showStore.mem = showStore.mem.filter(r => r.id !== id);
+  refreshShowLib();
+}
+
+/* Build a playable take from a stored record (cached per record per session
+   so object URLs aren't recreated on every press). */
+function takeFromRecord(rec) {
+  if (rec._take) return rec._take;
+  rec._take = {
+    duration: rec.duration,
+    events: rec.events,
+    amps: rec.amps,
+    audioBlob: rec.audioBlob || null,
+    audioURL: rec.audioBlob ? URL.createObjectURL(rec.audioBlob) : null,
+    keyframes: buildKeyframes(rec.events),
+    saved: true
+  };
+  return rec._take;
+}
+/* ============================================================================
    CHARACTER BUILDER — assemble a character from costume slots. Every option
    is recolored by remapping palette indices (see remapFor); the preview is a
    real Puppet walking in place with the mouth cycling, so what you see is
@@ -1810,6 +2069,7 @@ function rebuildPreview() {
 }
 
 function enterBuilder(rosterIndex) {
+  builder.returnTo = (mode === "title") ? "title" : "stage";
   mode = "builder";
   builder.editIndex = rosterIndex;
   builder.spec = rosterIndex >= 0
@@ -1819,7 +2079,7 @@ function enterBuilder(rosterIndex) {
   rebuildPreview();
 }
 
-function exitBuilder() { textInput = null; mode = "stage"; }
+function exitBuilder() { textInput = null; titleParade = []; mode = builder.returnTo || "stage"; if (mode === "title") enterTitle(); }
 
 function builderSave() {
   const b = builder;
@@ -2051,10 +2311,10 @@ function renderDrawer(ctx) {
   // backdrop thumbnails (nearest-neighbor shrink of the scene canvases)
   drawText(ctx, "SCENE", IW - 104, y0 + 2, SILVER);
   for (let i = 0; i < BACKDROPS.length; i++) {
-    const bx = IW - 104 + (i % 2) * 51, by = y0 + 11 + Math.floor(i / 2) * 16;
-    ctx.drawImage(BACKDROPS[i].canvas, 0, 0, IW, IH, bx, by, 49, 14);
-    frameRect(ctx, bx, by, 49, 14, live.backdrop === i ? ICE : SLATE);
-    uiBtn(bx, by, 49, 14, ((idx) => () => setBackdrop(idx))(i));
+    const bx = IW - 104 + (i % 4) * 25, by = y0 + 11 + Math.floor(i / 4) * 16;
+    ctx.drawImage(BACKDROPS[i].canvas, 0, 0, IW, IH, bx, by, 24, 14);
+    frameRect(ctx, bx, by, 24, 14, live.backdrop === i ? ICE : SLATE);
+    uiBtn(bx, by, 24, 14, ((idx) => () => setBackdrop(idx))(i));
   }
 }
 
@@ -2111,11 +2371,13 @@ function renderTopBar(ctx, speaker) {
   let x = 2;
   const bar = [];
   if (!recording) {
+    bar.push(["MENU", () => enterTitle()]);
     bar.push(["BUILD", () => enterBuilder(-1)]);
     bar.push(["REC", () => { requestMic(); startRecording(); toast(mic.ok ? "RECORDING!" : "RECORDING (NO MIC - SILENT TAKE)"); }, RED]);
     if (take) {
-      bar.push(["PLAY", () => enterPlayback(), LIME]);
-      bar.push(["EXPORT", () => { startExport(); }, SKY]);
+      bar.push(["PLAY", () => enterPlayback(take, "stage"), LIME]);
+      bar.push(["EXPORT", () => startExport(take, "stage"), SKY]);
+      if (!take.saved) bar.push(["SAVE SHOW", () => saveCurrentShow(), SAND]);
       bar.push(["DISCARD", () => { discardTake(); toast("TAKE DISCARDED"); }]);
     }
   } else {
@@ -2184,7 +2446,7 @@ function renderHelp(ctx) {
 const SCRUB = { x: 76, y: IH - 14, w: IW - 130, h: 10 };
 function renderTransport(ctx) {
   rect(ctx, 0, IH - 18, IW, 18, NIGHT);
-  const t = clamp(playbackClock(), 0, take.duration);
+  const t = clamp(playbackClock(), 0, play.take.duration);
   const items = [
     [play.playing ? "PAUSE" : "PLAY", () => { play.playing ? pausePlayback() : resumePlayback(); }],
     ["STOP", () => exitPlayback()]
@@ -2199,21 +2461,21 @@ function renderTransport(ctx) {
   }
   // scrub bar
   panel(ctx, SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, DUSK, SILVER);
-  const fill = Math.floor((SCRUB.w - 2) * (t / take.duration));
+  const fill = Math.floor((SCRUB.w - 2) * (t / play.take.duration));
   rect(ctx, SCRUB.x + 1, SCRUB.y + 1, fill, SCRUB.h - 2, SKY);
   rect(ctx, SCRUB.x + 1 + fill, SCRUB.y + 1, 1, SCRUB.h - 2, WHITE);
   uiBtn(SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, (mx) => {
     scrubbing = true;
     scrubTo(mx);
   });
-  drawTextR(ctx, fmtTime(t) + "/" + fmtTime(take.duration), IW - 3, IH - 12, WHITE);
+  drawTextR(ctx, fmtTime(t) + "/" + fmtTime(play.take.duration), IW - 3, IH - 12, WHITE);
   drawTextC(ctx, "PLAYBACK", IW / 2, 2, ICE);
 }
 function scrubTo(mx) {
   const f = clamp((mx - SCRUB.x - 1) / (SCRUB.w - 2), 0, 1);
   const wasPlaying = play.playing;
   pausePlayback();
-  seekPlayback(Math.round(f * take.duration));
+  seekPlayback(Math.round(f * play.take.duration));
   if (wasPlaying) resumePlayback();
 }
 
@@ -2224,6 +2486,111 @@ function renderToast(ctx) {
   const x = (IW - w) >> 1, y = IH - DRAWER_H - 16;
   panel(ctx, x, y, w, 12, NIGHT, SAND);
   drawText(ctx, toastMsg, x + 5, y + 3, SAND);
+}
+/* ============================================================================
+   TITLE SCREEN + SHOW LIBRARY
+   The title uses the theater backdrop with a small puppet parade marching
+   across the stage. The library lists saved shows with play/export/delete.
+   ==========================================================================*/
+
+const THEATER_BD = BACKDROPS.findIndex(b => b.id === "theater");
+let titleParade = [];   // decorative puppets marching across the title screen
+
+function enterTitle() {
+  mode = "title";
+  if (!titleParade.length && roster.length) {
+    for (let i = 0; i < Math.min(3, roster.length); i++) {
+      const p = new Puppet(roster[i], 40 + i * 90, 174, 0);
+      p.facing = 1;
+      titleParade.push(p);
+    }
+  }
+}
+
+function updateTitle(dt) {
+  for (const p of titleParade) {
+    p.fx += 0.45;
+    if (p.fx > IW + 16) p.fx = -16;
+    p.animate(dt, 0.45);
+  }
+}
+
+function renderTitle(ctx) {
+  ctx.drawImage(BACKDROPS[THEATER_BD].canvas, 0, 0);
+  for (const p of titleParade) drawPuppet(ctx, p, { clean: true });
+  // big title with a 1px drop shadow (two blits, no blending)
+  drawTextC(ctx, "PIXEL PUPPETS", IW / 2 + 1, 27, NIGHT, 2);
+  drawTextC(ctx, "PIXEL PUPPETS", IW / 2, 26, SAND, 2);
+  drawTextC(ctx, "BUILD PUPPETS. PUT ON A SHOW.", IW / 2, 44, WHITE);
+  const items = [
+    ["NEW SHOW", () => { mode = "stage"; }],
+    ["SHOW LIBRARY (" + showLib.length + ")", () => { refreshShowLib(); mode = "library"; }],
+    ["CHARACTER BUILDER", () => enterBuilder(-1)]
+  ];
+  let y = 66;
+  for (const [label, cb] of items) {
+    const w = 130;
+    const x = (IW - w) >> 1;
+    panel(ctx, x, y, w, 16, NIGHT, SAND);
+    drawTextC(ctx, label, IW / 2, y + 5, WHITE);
+    uiBtn(x, y, w, 16, cb);
+    y += 20;
+  }
+  drawTextC(ctx, "UP TO 3 PLAYERS ON ONE KEYBOARD", IW / 2, 128, SILVER);
+}
+
+/* ---- Library ------------------------------------------------------------ */
+let libScroll = 0;
+const LIB_ROWS = 6;
+
+function renderLibrary(ctx) {
+  rect(ctx, 0, 0, IW, IH, NAVY);
+  rect(ctx, 0, 0, IW, 16, NIGHT);
+  drawTextC(ctx, "SHOW LIBRARY", IW / 2, 1, WHITE, 2);
+  panel(ctx, 4, 2, 34, 12, DUSK, SLATE);
+  drawText(ctx, "BACK", 9, 5, WHITE);
+  uiBtn(4, 2, 34, 12, () => { mode = "title"; });
+
+  if (!showLib.length) {
+    drawTextC(ctx, "NO SAVED SHOWS YET", IW / 2, 74, WHITE);
+    drawTextC(ctx, "RECORD A SHOW ON THE STAGE, THEN", IW / 2, 88, SILVER);
+    drawTextC(ctx, "PRESS SAVE SHOW TO KEEP IT HERE", IW / 2, 97, SILVER);
+    return;
+  }
+  libScroll = clamp(libScroll, 0, Math.max(0, showLib.length - LIB_ROWS));
+  let y = 22;
+  for (let i = libScroll; i < Math.min(showLib.length, libScroll + LIB_ROWS); i++) {
+    const rec = showLib[i];
+    panel(ctx, 10, y, 300, 20, DUSK, SLATE);
+    drawText(ctx, rec.name, 16, y + 6, SAND);
+    drawText(ctx, fmtTime(rec.duration), 78, y + 6, WHITE);
+    drawText(ctx, rec.date, 112, y + 6, SILVER);
+    drawText(ctx, rec.audioBlob ? "VOICE" : "SILENT", 146, y + 6, rec.audioBlob ? ICE : SLATE);
+    const btns = [
+      ["PLAY", LIME, () => enterPlayback(takeFromRecord(rec), "library")],
+      ["EXPORT", SKY, () => startExport(takeFromRecord(rec), "library")],
+      ["DEL", RED, () => { deleteShowFromLib(rec.id); toast("DELETED " + rec.name); }]
+    ];
+    let bx = 196;
+    for (const [label, col, cb] of btns) {
+      const w = textW(label) + 8;
+      panel(ctx, bx, y + 3, w, 14, NIGHT, col);
+      drawText(ctx, label, bx + 4, y + 7, col);
+      uiBtn(bx, y + 3, w, 14, cb);
+      bx += w + 4;
+    }
+    y += 23;
+  }
+  if (showLib.length > LIB_ROWS) {
+    panel(ctx, 130, 164, 24, 12, DUSK, SLATE);
+    drawTextC(ctx, "UP", 142, 167, WHITE);
+    uiBtn(130, 164, 24, 12, () => { libScroll = Math.max(0, libScroll - 1); });
+    panel(ctx, 160, 164, 30, 12, DUSK, SLATE);
+    drawTextC(ctx, "DOWN", 175, 167, WHITE);
+    uiBtn(160, 164, 30, 12, () => { libScroll++; });
+    drawTextR(ctx, (libScroll + 1) + "-" + Math.min(showLib.length, libScroll + LIB_ROWS) + " OF " + showLib.length, IW - 10, 167, SILVER);
+  }
+  drawText(ctx, showStore.db ? "" : "NO STORAGE - SHOWS LAST THIS SESSION ONLY", 10, 167, ORANGE);
 }
 /* ============================================================================
    MAIN — fixed-timestep update loop, mouse/key routing, boot.
@@ -2264,6 +2631,8 @@ function update(dt) {
     if (recording) recordSample(speaker ? speaker.id : -1, amp);
   } else if (mode === "playback" || mode === "export") {
     stepPlayback(dt);
+  } else if (mode === "title") {
+    updateTitle(dt);
   }
   if (toastT > 0) toastT -= dt;
 }
@@ -2271,7 +2640,13 @@ function update(dt) {
 /* ---- render ------------------------------------------------------------- */
 function render(frameDt) {
   uiButtons = [];
-  if (mode === "builder") {
+  if (mode === "title") {
+    renderTitle(sctx);
+    renderToast(sctx);
+  } else if (mode === "library") {
+    renderLibrary(sctx);
+    renderToast(sctx);
+  } else if (mode === "builder") {
     renderBuilder(sctx, frameDt);
     renderToast(sctx);
   } else if (mode === "stage") {
@@ -2291,12 +2666,12 @@ function render(frameDt) {
     renderScene(sctx, play, { clean: true });
     captureExportFrame();                       // export gets the clean frame
     // progress overlay only on the visible screen, never in the file
-    const t = clamp(playbackClock(), 0, take.duration);
-    const pct = Math.floor(100 * t / take.duration);
+    const t = clamp(playbackClock(), 0, play.take.duration);
+    const pct = Math.floor(100 * t / play.take.duration);
     panel(sctx, 80, 80, 160, 30, NIGHT, ICE);
     drawTextC(sctx, "EXPORTING " + pct + "%", IW / 2, 84, WHITE);
     rect(sctx, 90, 96, 140, 8, DUSK);
-    rect(sctx, 90, 96, Math.floor(140 * t / take.duration), 8, SKY);
+    rect(sctx, 90, 96, Math.floor(140 * t / play.take.duration), 8, SKY);
     panel(sctx, 136, 114, 48, 12, DUSK, SLATE);
     drawTextC(sctx, "CANCEL", IW / 2, 117, WHITE);
     uiBtn(136, 114, 48, 12, () => cancelExport());
@@ -2311,7 +2686,10 @@ function onMouseDown(x, y) {
     hitUI(x, y);                  // ...unless the click re-focuses it
     return;
   }
-  if (mode === "playback" || mode === "export") { hitUI(x, y); return; }
+  if (mode === "title" || mode === "library" || mode === "playback" || mode === "export") {
+    hitUI(x, y);
+    return;
+  }
   // stage
   if (helpOpen) { hitUI(x, y); return; }
   if (hitUI(x, y)) return;
@@ -2342,6 +2720,7 @@ function onKeyPressed(code) {
     if (helpOpen) helpOpen = false;
     else if (mode === "builder") exitBuilder();
     else if (mode === "playback") exitPlayback();
+    else if (mode === "library") mode = "title";
     else selected = null;
   }
   // Delete removes the selected puppet — never while typing in a text field,
@@ -2353,6 +2732,8 @@ function onKeyPressed(code) {
 
 /* ---- boot + loop -------------------------------------------------------- */
 loadRoster();
+initShowStore();
+enterTitle();
 
 let lastT = performance.now(), acc = 0;
 function tick(now) {
