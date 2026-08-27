@@ -700,7 +700,22 @@ const TORSO_OPTIONS = [
     "999999999999",
     "999999999999",
     "999999999999",
-    "999999999999"] }
+    "999999999999"] },
+  { id: "gown", name: "BALL GOWN", rows: [   // taller than the others: the
+    "..99999999..",                          // bell skirt covers the legs
+    "..99999999..",
+    "..99999999..",
+    "...999999...",
+    "...999999...",
+    "..99999999..",
+    ".9999999999.",
+    ".9999999999.",
+    "999999999999",
+    "999999999999",
+    "999999999999",
+    "999999999999",
+    "9c9999999c99",
+    "cccccccccccc"] }
 ];
 
 /* Shoes: small sprite stamped at each leg frame's foot position. */
@@ -1187,10 +1202,13 @@ function drawWeather(ctx, kind, t) {
 }
 
 /* Scene-wipe transition: black blinds sweep closed then open over ~700ms,
-   covering the backdrop swap that lands mid-wipe. state.wipeT counts down. */
-function drawWipe(ctx, wipeT) {
-  if (!wipeT || wipeT <= 0) return;
-  const p = 1 - wipeT / 700;                       // 0 -> 1 over the wipe
+   covering the backdrop swap that lands mid-wipe. Driven by ELAPSED time
+   since the wipe started (state.wipeAt in that state's own clock), so a
+   stalled frame or a scrub can never leave the bars stuck on screen. */
+const WIPE_MS = 700;
+function drawWipe(ctx, elapsed) {
+  if (elapsed < 0 || elapsed >= WIPE_MS) return;
+  const p = elapsed / WIPE_MS;                     // 0 -> 1 over the wipe
   const cover = p < 0.5 ? p * 2 : (1 - p) * 2;     // close, then open
   const w = Math.floor(32 * cover);
   if (w <= 0) return;
@@ -1604,6 +1622,34 @@ const PROP_DEFS = [
     // minY lets the UFO fly high into the sky, far above the walking band
     vehicle: { seatDx: 0, seatDy: 9, accX: 0.18, topX: 2.0, accY: 0.18, topY: 1.5, minY: 38 },
     frames: [ufoFrame(0), ufoFrame(1)] },
+  { id: "chair", name: "CHAIR", ox: -8, oy: -24, fms: 999,
+    // a seat-only "vehicle": puppets sit via USE, but it never moves
+    vehicle: { seatDx: 1, seatDy: 2, accX: 0, topX: 0, accY: 0, topY: 0, seatOnly: true, exitDx: 14 },
+    frames: [[
+    ".3333",
+    ".3..3",
+    ".3333",
+    ".3..3",
+    ".3333",
+    ".3..3",
+    ".3333",
+    ".33",
+    ".33",
+    ".33",
+    ".33",
+    ".33",
+    ".33",
+    ".33",
+    "0333333333333330",
+    "0222222222222230",
+    "0333333333333330",
+    "..33.........33.",
+    "..33.........33.",
+    "..33.........33.",
+    "..33.........33.",
+    "..33.........33.",
+    "..33.........33.",
+    ".033.........330"]] },
   { id: "crate", name: "CRATE", ox: -7, oy: -13, fms: 999, hp: 2, frames: [[
     "00000000000000",
     "03333333333330",
@@ -1750,7 +1796,8 @@ function unboardVehicle(state, p) {
   const v = findEntity(state, p.vehicle);
   p.vehicle = null;
   if (v) {
-    p.fx = clamp(v.fx + (v.facing >= 0 ? -22 : 22), STAGE_MINX, STAGE_MAXX);
+    const step = (v.def.vehicle && v.def.vehicle.exitDx) || 22;
+    p.fx = clamp(v.fx + (v.facing >= 0 ? -step : step), STAGE_MINX, STAGE_MAXX);
     p.fy = clamp(v.fy, STAGE_MINY, STAGE_MAXY);
   }
   if (recording) {
@@ -2687,7 +2734,7 @@ const play = {
   effects: [],
   bubbles: [],
   weather: "none",
-  wipeT: 0,
+  wipeAt: -1e9,
   backdrop: 0,
   speakerId: -1,
   eventIdx: 0,
@@ -2751,7 +2798,7 @@ function seekPlayback(t) {
   play.effects = [];      // transient effects don't survive a scrub — fine
   play.bubbles = [];
   play.weather = "none";
-  play.wipeT = 0;
+  play.wipeAt = -1e9;
   play.backdrop = live.backdrop;
   play.speakerId = -1;
   play.eventIdx = 0;
@@ -2825,7 +2872,7 @@ function applyEvent(ev) {
       break;
     }
     case "weather": play.weather = ev.kind; break;
-    case "wipe": play.wipeT = 700; break;
+    case "wipe": play.wipeAt = ev.t; break;   // rendered from show-time
   }
 }
 
@@ -2878,7 +2925,6 @@ function stepPlayback(dt) {
   const jaw = play.mouth.update(amp, dt);
   for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
   duckMusic(jaw > 0);
-  if (play.wipeT > 0) play.wipeT -= dt;
   updateEffects(play, dt);
   if (t >= play.take.duration) {
     play.playing = false;
@@ -2960,6 +3006,14 @@ function startExport(t, returnTo, isRetry) {
   play.ended = false;
   if (audioEl) audioEl.play().catch(() => { play.audio = null; });
   recorder.start(250);
+  // Anti-stall pump: if the tab is throttled/backgrounded, rAF stops but the
+  // audio clock keeps running — which would freeze the picture mid-export.
+  // This timer notices starved frames and keeps update+render ticking.
+  ex.pump = setInterval(() => {
+    if (exporter !== ex) return;
+    const now = performance.now();
+    if (now - lastTickAt > 150) runFrame(now);
+  }, 100);
 }
 
 /* Blit the clean 320x180 frame up to the export canvas (integer 4x). */
@@ -2980,6 +3034,7 @@ function cancelExport() {
 }
 
 function deliverExport(ex) {
+  if (ex && ex.pump) clearInterval(ex.pump);
   if (exporter === ex) exporter = null;
   stopMusic();
   play.active = false;
@@ -3039,9 +3094,16 @@ function makeSpec(name, slots, colors) {
   };
 }
 
-/* Four pre-built characters. */
+function princessSpec() {
+  return makeSpec("PRINCESS", { head: "egg", hair: "long", hat: "crown", face: "big",
+                                torso: "gown", arms: "robe", legs: "bare", shoes: "heel", item: "none" },
+                  { skin: WHITE, hair: SAND, hat: SAND, torso: RED, arms: RED, shoes: SAND });
+}
+
+/* Five pre-built characters. */
 function prebuiltRoster() {
   return [
+    princessSpec(),
     makeSpec("SIR BLOO", { hat: "helmet", torso: "armor", arms: "armor", legs: "armor", shoes: "boot", item: "sword", face: "dot" },
              { hat: SILVER, torso: SKY, arms: SKY, legs: SLATE, shoes: DUSK, item: BLUE }),
     makeSpec("MERLA", { hat: "wizard", hair: "long", torso: "dress", arms: "robe", legs: "pants", shoes: "boot", item: "staff", face: "big", head: "egg" },
@@ -3068,7 +3130,7 @@ const canStore = storageAvailable();
 
 function saveRoster() {
   if (!canStore) return;
-  try { window.localStorage.setItem(STORE_KEY, JSON.stringify({ version: 1, characters: roster })); }
+  try { window.localStorage.setItem(STORE_KEY, JSON.stringify({ version: 2, characters: roster })); }
   catch (e) { /* quota or privacy mode: stay in-memory */ }
 }
 function loadRoster() {
@@ -3079,6 +3141,11 @@ function loadRoster() {
         const data = JSON.parse(raw);
         if (data && Array.isArray(data.characters) && data.characters.length) {
           roster = data.characters.map(c => makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {}));
+          // one-time upgrade: rosters saved before v2 gain the princess
+          if ((data.version || 1) < 2) {
+            if (!roster.some(c => c.slots.torso === "gown")) roster.unshift(princessSpec());
+            saveRoster();
+          }
           return;
         }
       }
@@ -3537,7 +3604,7 @@ function renderMusicEd(ctx) {
    ==========================================================================*/
 
 const live = { puppets: [], props: [], effects: [], bubbles: [], weather: "none",
-               wipeT: 0, pendingBackdrop: null, backdrop: 0 };
+               wipeAt: -1e9, pendingBackdrop: null, backdrop: 0 };
 let selected = null;
 let drawerOpen = true;
 let drawerTab = "cast";   // "cast" | "props"
@@ -3587,7 +3654,7 @@ function setWeather(kind) {
 }
 /* SCENE+ during recording: wipe transition with the backdrop swap mid-wipe. */
 function sceneWipe(nextIdx) {
-  live.wipeT = 700;
+  live.wipeAt = performance.now();
   if (recording) recEvent({ type: "wipe" });
   live.pendingBackdrop = { at: performance.now() + 350, idx: nextIdx };
 }
@@ -3615,7 +3682,7 @@ function renderScene(ctx, state, opts) {
   const now = opts.time !== undefined ? opts.time : performance.now();
   drawWeather(ctx, state.weather, now);
   drawBubbles(ctx, state, now);
-  drawWipe(ctx, state.wipeT);
+  drawWipe(ctx, now - state.wipeAt);
   if (!opts.clean) {
     for (const p of sorted) {
       if (p.scheme) {   // controller badge, hidden during playback/export
@@ -3701,20 +3768,20 @@ function renderDrawer(ctx) {
   } else {
     // props + vehicles
     for (const def of PROP_DEFS) {
-      if (x >= IW - 110) break;
-      panel(ctx, x, cy, 25, 24, DUSK, SLATE);
+      if (x + 22 > IW - 110) break;
+      panel(ctx, x, cy, 22, 24, DUSK, SLATE);
       const s = sprite(def.frames[0], {});
-      const fit = Math.min(1, Math.min(23 / s.w, 22 / s.h));
+      const fit = Math.min(1, Math.min(20 / s.w, 22 / s.h));
       const dw = Math.max(1, Math.floor(s.w * fit)), dh = Math.max(1, Math.floor(s.h * fit));
-      ctx.drawImage(s.cv, x + 1 + ((23 - dw) >> 1), cy + 1 + ((22 - dh) >> 1), dw, dh);
-      uiBtn(x, cy, 25, 24, ((id2) => () => {
+      ctx.drawImage(s.cv, x + 1 + ((20 - dw) >> 1), cy + 1 + ((22 - dh) >> 1), dw, dh);
+      uiBtn(x, cy, 22, 24, ((id2) => () => {
         selected = spawnStageProp(id2);
         toast("ADDED " + id2.toUpperCase());
       })(def.id));
-      panel(ctx, x, cy + 25, 25, 8, NAVY, SLATE);
-      const short = def.vehicle ? "DRIVE" : "PROP";
-      drawTextC(ctx, short, x + 12, cy + 26, def.vehicle ? ICE : SILVER);
-      x += 26;
+      panel(ctx, x, cy + 25, 22, 8, NAVY, SLATE);
+      const short = def.vehicle ? (def.vehicle.seatOnly ? "SIT" : "RIDE") : "PROP";
+      drawTextC(ctx, short, x + 11, cy + 26, def.vehicle ? ICE : SILVER);
+      x += 23;
     }
   }
 
@@ -4147,7 +4214,6 @@ function update(dt) {
     if (recording) recordSample(speaker ? speaker.id : -1, amp);
     speechStep(speaker);                       // auto-caption utterances
     duckMusic(jaw > 0);                        // narration over the theme song
-    if (live.wipeT > 0) live.wipeT -= dt;
     if (live.pendingBackdrop && performance.now() >= live.pendingBackdrop.at) {
       setBackdrop(live.pendingBackdrop.idx);   // lands mid-wipe
       live.pendingBackdrop = null;
@@ -4302,15 +4368,19 @@ loadTracks();
 initShowStore();
 enterTitle();
 
-let lastT = performance.now(), acc = 0;
-function tick(now) {
-  requestAnimationFrame(tick);
+let lastT = performance.now(), acc = 0, lastTickAt = 0;
+function runFrame(now) {
+  lastTickAt = now;
   let frameDt = now - lastT;
   lastT = now;
   if (frameDt > 250) frameDt = 250;   // tab was hidden: don't spiral
   acc += frameDt;
   while (acc >= STEP) { update(STEP); acc -= STEP; }
   render(frameDt);
+}
+function tick(now) {
+  requestAnimationFrame(tick);
+  runFrame(now);
 }
 requestAnimationFrame(tick);
 </script>
