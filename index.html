@@ -571,9 +571,9 @@ const HAIR_OPTIONS = [
 const HAT_OPTIONS = [
   { id: "none", name: "NONE", rows: null, dy: 0 },
   { id: "cap", name: "CAP", dy: -3, rows: [
-    "..999999....",
-    ".99999999...",
-    ".9999999999."] },
+    "..999999",
+    ".999999999",
+    ".9999999999999"] },   // long bottom row = the brim, out past the face
   { id: "tophat", name: "TOP HAT", dy: -7, rows: [
     "...999999...",
     "...999999...",
@@ -797,9 +797,11 @@ const JAW_SPRITES = [
 
 /* ---- Rig geometry: integer offsets from the feet origin (facing right) -- */
 const RIG = {
-  head:   { ox: -6, oy: -30 },
-  faceDx: -5, faceDy: 3,       // relative to head top(-30): eyes line
-  mouthDx: -1, mouthDy: -24,   // jaw top-left, from origin (biased toward facing)
+  // The head leans 1px toward the facing side, and the eyes and mouth sit
+  // clearly toward that side, so a puppet visibly faces the way it walks.
+  head:   { ox: -5, oy: -30 },
+  faceDx: -4, faceDy: 3,       // relative to head top(-30): eyes line
+  mouthDx: 0, mouthDy: -24,    // jaw top-left, from origin (biased toward facing)
   torso:  { ox: -6, oy: -20 },
   shoulderR: { x: 5,  y: -19 },
   shoulderL: { x: -7, y: -19 },
@@ -1296,8 +1298,8 @@ function drawPuppet(ctx, p, opts) {
   acc(blitPart(ctx, P.jaws[p.jaw], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
   const face = (p.blinkHold > 0) ? P.faceClosed : P.faceOpen;
   acc(blitPart(ctx, face, x, y, RIG.faceDx, RIG.head.oy + RIG.faceDy + bob, fc));
-  if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, -6, RIG.head.oy + P.hair.dy + bob, fc));
-  if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, -6, RIG.head.oy + P.hat.dy + bob, fc));
+  if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, RIG.head.ox, RIG.head.oy + P.hair.dy + bob, fc));
+  if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, RIG.head.ox, RIG.head.oy + P.hat.dy + bob, fc));
   armR.draw();
   if (P.item) {
     const hx = RIG.shoulderR.x + armR.fr.end[0], hy = RIG.shoulderR.y + armR.fr.end[1];
