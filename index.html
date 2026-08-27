@@ -1971,6 +1971,7 @@ function interactProp(p, v) {
   if (!result) return false;
   p.useT = 260;
   propFX(live, v, result);
+  netFX({ kind: "prop", pid: v.id, result });
   if (recording) recEvent({ type: "interact", id: p.id, pid: v.id, result });
   if (result === "break") removePuppet(v);   // records the remove event too
   return true;
@@ -3861,8 +3862,10 @@ function renderScene(ctx, state, opts) {
   drawWipe(ctx, now - state.wipeAt);
   if (!opts.clean) {
     for (const p of sorted) {
-      if (p.scheme) {   // controller badge, hidden during playback/export
-        const label = SCHEMES[p.scheme].label;
+      // controller badge (or its mirrored copy on a guest screen); hidden
+      // during playback and export
+      const label = p.isProp ? "" : (p.scheme ? SCHEMES[p.scheme].label : (p.netBadge || ""));
+      if (label) {
         const w = textW(label) + 4;
         const bx = p.x - (w >> 1), by = p.bbox.y - 10;
         rect(ctx, bx, by, w, 9, NIGHT);
@@ -3993,7 +3996,10 @@ function renderSelectionPanel(ctx) {
   panel(ctx, x0, y0, 76, isProp ? 56 : 84, NIGHT, SILVER);
   drawTextC(ctx, isProp ? p.def.name : p.spec.name, x0 + 38, y0 + 2, SAND);
   let ry;
-  if (!isProp) {
+  if (!isProp && p.guest) {
+    drawText(ctx, "PLAYER 2 (REMOTE)", x0 + 4, y0 + 13, LIME);
+    ry = y0 + 24;
+  } else if (!isProp) {
     drawText(ctx, "CONTROLS", x0 + 4, y0 + 11, SILVER);
     let bx = x0 + 4;
     for (const name of SCHEME_NAMES) {
@@ -4078,6 +4084,8 @@ function renderTopBar(ctx, speaker) {
     if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - textW(label) - 14, 4, 6, 6, RED);
     drawTextR(ctx, label, IW - 4, 4, RED);
     frameRect(ctx, 0, 0, IW, IH, RED);
+  } else if (net.hosting) {
+    drawTextR(ctx, "ROOM " + net.code + (net.conn ? " - 2P" : " - WAITING"), IW - 4, 4, net.conn ? LIME : ICE);
   } else if (!mic.ok && mic.requested) {
     drawTextR(ctx, "NO MIC", IW - 4, 4, SILVER);
   }
@@ -4287,20 +4295,21 @@ function renderTitle(ctx) {
   drawTextC(ctx, "BUILD PUPPETS. PUT ON A SHOW.", IW / 2, 44, WHITE);
   const items = [
     ["NEW SHOW", () => { mode = "stage"; }],
+    ["PLAY TOGETHER", () => enterNet()],
     ["SHOW LIBRARY (" + showLib.length + ")", () => { refreshShowLib(); mode = "library"; }],
     ["CHARACTER BUILDER", () => enterBuilder(-1)],
     ["MUSIC STUDIO", () => enterMusicEd()]
   ];
-  let y = 58;
+  let y = 52;
   for (const [label, cb] of items) {
     const w = 130;
     const x = (IW - w) >> 1;
-    panel(ctx, x, y, w, 15, NIGHT, SAND);
-    drawTextC(ctx, label, IW / 2, y + 4, WHITE);
-    uiBtn(x, y, w, 15, cb);
-    y += 18;
+    panel(ctx, x, y, w, 14, NIGHT, SAND);
+    drawTextC(ctx, label, IW / 2, y + 3, WHITE);
+    uiBtn(x, y, w, 14, cb);
+    y += 17;
   }
-  drawTextC(ctx, "2 PLAYERS ON ONE KEYBOARD - VOICES, FACES + MUSIC", IW / 2, 133, SILVER);
+  drawTextC(ctx, "2 PLAYERS - ONE KEYBOARD OR TWO COMPUTERS", IW / 2, 139, SILVER);
 }
 
 /* ---- Library ------------------------------------------------------------ */
@@ -4358,6 +4367,475 @@ function renderLibrary(ctx) {
   drawText(ctx, showStore.db ? "" : "NO STORAGE - SHOWS LAST THIS SESSION ONLY", 10, 167, ORANGE);
 }
 /* ============================================================================
+   PLAY TOGETHER — two computers, one stage, via PeerJS data channels.
+
+   The HOST runs the whole show exactly as in single-player: physics, mic,
+   recording, playback, export — nothing about the capture model changes.
+   The GUEST is a remote controller with a mirrored view:
+
+     guest --> host   {a:"join", spec}       my character (from MY roster)
+                      {a:"k", m, talk}       held-direction bitmask + talk key
+                                             (sent on change + as keepalive)
+                      {a:"use"} {a:"expr"}   one-shot actions
+                      {a:"bub", text}        typed speech bubble
+                      {a:"need", id}         please describe this entity
+     host --> guest   {a:"init"|"ent" ...}   entity descriptors (spec ids only)
+                      {a:"s", ...}           ~20Hz state snapshot: positions,
+                                             jaws, expressions, vehicles,
+                                             bubbles, weather, wipe, scene,
+                                             REC flag, music-cue name, or
+                                             busy:1 while the host is in a
+                                             menu (guest shows a curtain)
+                      {a:"fx", ...}          ability/prop effect triggers
+                                             (particles re-spawn locally)
+
+   Audio never crosses the wire: the players share a room, so the HOST mic
+   records both voices; the guest's talk key only marks WHO is speaking.
+   Guest inputs land in the host's ordinary `held` set under virtual G_*
+   codes with a virtual "GUEST" scheme, so driving, talking, recording and
+   playback need no special cases. Room codes are 4 characters, unambiguous
+   alphabet. PeerJS loads from its CDN on first use (skipped if a Peer
+   implementation is already present).
+   ==========================================================================*/
+
+const NET_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const NET_PREFIX = "pixpup-";
+SCHEMES.GUEST = { left: "G_LEFT", right: "G_RIGHT", up: "G_UP", down: "G_DOWN",
+                  talk: "G_TALK", use: "G_USE", label: "GUEST" };
+
+const net = {
+  peer: null, conn: null,
+  hosting: false, guesting: false,
+  code: null, screen: null, status: "",
+  guestPuppetId: null,          // host: the guest's puppet id
+  myId: null, mySpec: null,     // guest: my puppet
+  mirror: { puppets: [], props: [], effects: [], bubbles: [], weather: "none",
+            wipeAt: -1e9, backdrop: 0 },
+  targets: new Map(),           // guest: id -> latest snapshot fields
+  pendingNeed: new Set(),
+  hostBusy: false, hostRec: false, cueName: null,
+  lastSnapAt: 0, lastRecvAt: 0, keepAcc: 0, lastMask: -1, lastTalk: false
+};
+
+function loadPeerJs() {
+  return new Promise((res, rej) => {
+    if (window.Peer) return res();
+    const s = document.createElement("script");
+    s.src = "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js";
+    s.onload = () => window.Peer ? res() : rej(new Error("peerjs missing"));
+    s.onerror = () => rej(new Error("peerjs load failed"));
+    document.head.appendChild(s);
+  });
+}
+function netSend(msg) {
+  if (net.conn && net.conn.open !== false) { try { net.conn.send(msg); } catch (e) {} }
+}
+function makeRoomCode() {
+  let c = "";
+  for (let i = 0; i < 4; i++) c += NET_ALPHABET[Math.floor(Math.random() * NET_ALPHABET.length)];
+  return c;
+}
+
+function enterNet() { mode = "net"; net.screen = "menu"; net.status = ""; }
+function leaveNet(toTitle) {
+  netSend({ a: "bye" });
+  if (net.peer) { try { net.peer.destroy(); } catch (e) {} }
+  if (net.hosting && net.guestPuppetId) {
+    const p = findEntity(live, net.guestPuppetId);
+    if (p) p.scheme = null;
+  }
+  for (const c of ["G_LEFT", "G_RIGHT", "G_UP", "G_DOWN", "G_TALK"]) held.delete(c);
+  talkStack = talkStack.filter(n => n !== "GUEST");
+  net.peer = net.conn = null;
+  net.hosting = net.guesting = false;
+  net.code = net.screen = null;
+  net.guestPuppetId = net.myId = null;
+  net.mirror.puppets = []; net.mirror.props = []; net.mirror.effects = []; net.mirror.bubbles = [];
+  net.targets.clear(); net.pendingNeed.clear();
+  if (toTitle) enterTitle();
+}
+
+/* ---- host --------------------------------------------------------------- */
+function startHosting() {
+  net.screen = "hosting";
+  net.status = "STARTING...";
+  loadPeerJs().then(() => {
+    const tryCode = () => {
+      net.code = makeRoomCode();
+      const peer = new Peer(NET_PREFIX + net.code);
+      net.peer = peer;
+      peer.on("open", () => { net.hosting = true; net.status = "WAITING FOR PLAYER 2..."; });
+      peer.on("error", (err) => {
+        if (err && err.type === "unavailable-id") tryCode();       // code collision
+        else net.status = "CONNECTION ERROR - TRY AGAIN";
+      });
+      peer.on("connection", (conn) => {
+        if (net.conn) { try { conn.close(); } catch (e) {} return; }   // room is full
+        net.conn = conn;
+        conn.on("data", (d) => hostOnData(d));
+        conn.on("close", () => hostGuestLeft());
+        conn.on("error", () => hostGuestLeft());
+        net.status = "PLAYER 2 CONNECTED!";
+        net.lastRecvAt = performance.now();
+      });
+    };
+    tryCode();
+  }).catch(() => { net.status = "COULD NOT LOAD PEERJS (OFFLINE?)"; });
+}
+function hostGuestLeft() {
+  if (net.guestPuppetId) {
+    const p = findEntity(live, net.guestPuppetId);
+    if (p) p.scheme = null;
+  }
+  for (const c of ["G_LEFT", "G_RIGHT", "G_UP", "G_DOWN", "G_TALK"]) held.delete(c);
+  talkStack = talkStack.filter(n => n !== "GUEST");
+  net.conn = null;
+  net.guestPuppetId = null;
+  toast("PLAYER 2 LEFT THE ROOM");
+}
+
+function entDescriptor(e) {
+  return e.isProp ? { a: "ent", k: "v", id: e.id, propId: e.propId, x: e.x, y: e.y }
+                  : { a: "ent", k: "p", id: e.id, spec: e.spec, x: e.x, y: e.y };
+}
+function hostOnData(d) {
+  if (!d || typeof d !== "object") return;
+  net.lastRecvAt = performance.now();
+  switch (d.a) {
+    case "join": {
+      const spec = makeSpec((d.spec && d.spec.name) || "GUEST", (d.spec && d.spec.slots) || {}, (d.spec && d.spec.colors) || {});
+      const p = spawnPuppet(spec, 240, 150);
+      p.scheme = "GUEST";
+      p.guest = true;
+      net.guestPuppetId = p.id;
+      const ents = [...live.puppets, ...live.props].map(entDescriptor);
+      netSend({ a: "init", ents, you: p.id });
+      toast((spec.name || "PLAYER 2") + " JOINED THE SHOW");
+      break;
+    }
+    case "k": {
+      const m = d.m | 0;
+      const set = (code, on) => { if (on) held.add(code); else held.delete(code); };
+      set("G_LEFT", m & 1); set("G_RIGHT", m & 2); set("G_UP", m & 4); set("G_DOWN", m & 8);
+      const talking = !!d.talk;
+      const inStack = talkStack.includes("GUEST");
+      if (talking && !inStack) talkStack.push("GUEST");
+      if (!talking && inStack) talkStack = talkStack.filter(n => n !== "GUEST");
+      break;
+    }
+    case "use": {
+      const p = findEntity(live, net.guestPuppetId);
+      if (p && mode === "stage") useAction(p);
+      break;
+    }
+    case "expr": {
+      const p = findEntity(live, net.guestPuppetId);
+      if (p && EXPRESSIONS[d.kind]) exprAction(p, d.kind);
+      break;
+    }
+    case "bub": {
+      const p = findEntity(live, net.guestPuppetId);
+      const text = String(d.text || "").slice(0, 60).trim();
+      if (p && text) {
+        const dur = Math.max(1800, Math.min(6000, 1200 + text.length * 55));
+        liveBubble(p.id, text, dur);
+        if (recording) recEvent({ type: "bubble", id: p.id, text, dur });
+      }
+      break;
+    }
+    case "need": {
+      const e = findEntity(live, d.id);
+      if (e) netSend(entDescriptor(e));
+      break;
+    }
+    case "bye": hostGuestLeft(); break;
+  }
+}
+/* One-shot visual triggers so the guest can re-spawn matching particles. */
+function netFX(obj) {
+  if (net.hosting && net.conn) netSend(Object.assign({ a: "fx" }, obj));
+}
+
+function hostTick(dt) {
+  if (!net.hosting || !net.conn) return;
+  net.sendAcc = (net.sendAcc || 0) + dt;
+  const busy = mode !== "stage";
+  if (net.sendAcc < (busy ? 500 : 50)) return;
+  net.sendAcc = 0;
+  if (busy) { netSend({ a: "s", busy: 1 }); return; }
+  const snap = {
+    a: "s",
+    bd: live.backdrop,
+    w: live.weather,
+    wip: Math.round(performance.now() - live.wipeAt),
+    r: recording ? 1 : 0,
+    cue: music.playing ? music.playing.track.name : null,
+    P: live.puppets.map(p => [p.id, p.x, p.y, p.facing, p.jaw,
+      p.expression || "", Math.max(0, Math.round(p.exprT)), Math.max(0, Math.round(p.useT)),
+      p.vehicle || 0, p.scheme ? SCHEMES[p.scheme].label : "",
+      p.layerMode === "manual" ? 1 : 0, p.manualZ]),
+    V: live.props.map(v => [v.id, v.x, v.y, v.facing, v.layerMode === "manual" ? 1 : 0, v.manualZ]),
+    B: live.bubbles.map(b => [b.id, b.text, Math.max(0, Math.round(b.until - performance.now()))])
+  };
+  netSend(snap);
+}
+
+/* ---- guest -------------------------------------------------------------- */
+function startJoin(code) {
+  net.screen = "join";
+  net.status = "CONNECTING...";
+  loadPeerJs().then(() => {
+    const peer = new Peer();
+    net.peer = peer;
+    peer.on("error", () => { net.status = "COULD NOT REACH ROOM " + code; });
+    peer.on("open", () => {
+      const conn = peer.connect(NET_PREFIX + code, { reliable: true });
+      net.conn = conn;
+      conn.on("open", () => {
+        net.guesting = true;
+        net.code = code;
+        net.screen = "picker";
+        net.status = "";
+        net.lastRecvAt = performance.now();
+      });
+      conn.on("data", (d) => guestOnData(d));
+      conn.on("close", () => { if (net.guesting) { toast("HOST CLOSED THE ROOM"); leaveNet(true); } });
+      conn.on("error", () => { net.status = "CONNECTION FAILED"; });
+    });
+  }).catch(() => { net.status = "COULD NOT LOAD PEERJS (OFFLINE?)"; });
+}
+function guestPick(spec) {
+  net.mySpec = JSON.parse(JSON.stringify(spec));
+  netSend({ a: "join", spec: net.mySpec });
+  mode = "net-guest";
+  net.screen = null;
+}
+function guestAddEnt(d) {
+  if (findEntity(net.mirror, d.id)) return;
+  if (d.k === "p") net.mirror.puppets.push(new Puppet(d.spec, d.x, d.y, d.id));
+  else net.mirror.props.push(new Prop(d.propId, d.x, d.y, d.id));
+  net.pendingNeed.delete(d.id);
+}
+function guestOnData(d) {
+  if (!d || typeof d !== "object") return;
+  net.lastRecvAt = performance.now();
+  switch (d.a) {
+    case "init":
+      net.myId = d.you;
+      for (const e of d.ents) guestAddEnt(e);
+      break;
+    case "ent": guestAddEnt(d); break;
+    case "s": {
+      if (d.busy) { net.hostBusy = true; return; }
+      net.hostBusy = false;
+      net.mirror.backdrop = d.bd;
+      net.mirror.weather = d.w;
+      net.mirror.wipeAt = performance.now() - d.wip;
+      net.hostRec = !!d.r;
+      net.cueName = d.cue;
+      const seen = new Set();
+      for (const row of d.P) { seen.add(row[0]); net.targets.set(row[0], { k: "p", row }); }
+      for (const row of d.V) { seen.add(row[0]); net.targets.set(row[0], { k: "v", row }); }
+      // reconcile: drop mirrored entities the host no longer has
+      net.mirror.puppets = net.mirror.puppets.filter(p => seen.has(p.id));
+      net.mirror.props = net.mirror.props.filter(p => seen.has(p.id));
+      for (const id of [...net.targets.keys()]) if (!seen.has(id)) net.targets.delete(id);
+      // ask (once) about ids we can't draw yet
+      for (const id of seen) {
+        if (!findEntity(net.mirror, id) && !net.pendingNeed.has(id)) {
+          net.pendingNeed.add(id);
+          netSend({ a: "need", id });
+        }
+      }
+      // my puppet vanished (host deleted it): pick a new character
+      if (net.myId && !seen.has(net.myId)) { net.myId = null; mode = "net"; net.screen = "picker"; }
+      net.mirror.bubbles = d.B.map(([id, text, left]) => ({ id, text, until: performance.now() + left }));
+      break;
+    }
+    case "fx": {
+      if (d.kind === "ability") {
+        const p = findEntity(net.mirror, d.id);
+        if (p && !p.isProp) spawnAbility(net.mirror, p);
+      } else if (d.kind === "prop") {
+        const v = findEntity(net.mirror, d.pid);
+        if (v) propFX(net.mirror, v, d.result);
+      }
+      break;
+    }
+    case "bye": toast("HOST LEFT"); leaveNet(true); break;
+  }
+}
+
+/* Guest fixed-step: ease mirrored entities toward their snapshot targets and
+   reuse the ordinary animation machinery on the interpolated motion. */
+function guestTick(dt) {
+  if (!net.guesting) return;
+  // input: both key sets fold into one logical mask
+  if (mode === "net-guest" && !textInput) {
+    const m = (held.has("KeyA") || held.has("ArrowLeft") ? 1 : 0)
+            | (held.has("KeyD") || held.has("ArrowRight") ? 2 : 0)
+            | (held.has("KeyW") || held.has("ArrowUp") ? 4 : 0)
+            | (held.has("KeyS") || held.has("ArrowDown") ? 8 : 0);
+    const talk = held.has("ShiftLeft") || held.has("ShiftRight");
+    net.keepAcc += dt;
+    if (m !== net.lastMask || talk !== net.lastTalk || net.keepAcc > 400) {
+      net.lastMask = m; net.lastTalk = talk; net.keepAcc = 0;
+      netSend({ a: "k", m, talk });
+    }
+  }
+  if (net.hostBusy || mode !== "net-guest") return;
+  for (const e of [...net.mirror.puppets, ...net.mirror.props]) {
+    const tgt = net.targets.get(e.id);
+    if (!tgt) continue;
+    const r = tgt.row;
+    const px0 = e.fx;
+    e.fx += (r[1] - e.fx) * 0.4;
+    e.fy += (r[2] - e.fy) * 0.4;
+    const dx = e.fx - px0;
+    e.facing = r[3];
+    if (e.isProp) {
+      e.animT += dt;
+      e.wheelPhase += Math.abs(dx) * 0.25;
+      e.layerMode = r[4] ? "manual" : "auto"; e.manualZ = r[5];
+    } else {
+      e.animate(dt, e.vehicle ? 0 : dx);
+      e.jaw = r[4];
+      e.expression = r[5] || null;
+      e.exprT = r[6];
+      e.useT = r[7];
+      e.vehicle = r[8] || null;
+      e.netBadge = r[9] || "";
+      e.layerMode = r[10] ? "manual" : "auto"; e.manualZ = r[11];
+    }
+  }
+  updateEffects(net.mirror, dt);
+}
+
+function netTick(dt) {
+  hostTick(dt);
+  guestTick(dt);
+  // connection watchdog
+  if ((net.guesting || (net.hosting && net.conn)) && performance.now() - net.lastRecvAt > 8000) {
+    if (net.guesting) { toast("LOST THE HOST - LEAVING ROOM"); leaveNet(true); }
+    else hostGuestLeft();
+  }
+}
+
+/* ---- screens ------------------------------------------------------------ */
+const joinInput = { text: "" };
+function renderNet(ctx) {
+  ctx.drawImage(BACKDROPS[THEATER_BD].canvas, 0, 0);
+  rect(ctx, 40, 20, 240, 140, NIGHT);
+  frameRect(ctx, 40, 20, 240, 140, SAND);
+  drawTextC(ctx, "PLAY TOGETHER", IW / 2, 26, SAND, 2);
+  if (net.screen === "menu") {
+    drawTextC(ctx, "TWO PLAYERS, TWO COMPUTERS, ONE ROOM", IW / 2, 46, SILVER);
+    drawTextC(ctx, "(SIT TOGETHER - ONE MIC RECORDS EVERYONE)", IW / 2, 55, SILVER);
+    const items = [
+      ["HOST A ROOM", () => startHosting()],
+      ["JOIN A ROOM", () => {
+        net.screen = "joincode"; joinInput.text = "";
+        textInput = { tag: "roomcode", max: 4,
+          get: () => joinInput.text,
+          set: (v) => { joinInput.text = v.toUpperCase().replace(/[^A-Z0-9]/g, ""); },
+          onEnter: () => { if (joinInput.text.length === 4) startJoin(joinInput.text); else net.screen = "menu"; } };
+      }],
+      ["BACK", () => leaveNet(true)]
+    ];
+    let y = 70;
+    for (const [label, cb] of items) {
+      panel(ctx, 100, y, 120, 15, DUSK, SILVER);
+      drawTextC(ctx, label, IW / 2, y + 4, WHITE);
+      uiBtn(100, y, 120, 15, cb);
+      y += 19;
+    }
+  } else if (net.screen === "hosting") {
+    drawTextC(ctx, "ROOM CODE", IW / 2, 52, SILVER);
+    drawTextC(ctx, net.code || "....", IW / 2, 64, WHITE, 2);
+    drawTextC(ctx, net.status, IW / 2, 90, net.conn ? LIME : ICE);
+    drawTextC(ctx, "PLAYER 2: OPEN THE GAME, PLAY TOGETHER,", IW / 2, 104, SILVER);
+    drawTextC(ctx, "JOIN A ROOM, AND TYPE THIS CODE", IW / 2, 113, SILVER);
+    panel(ctx, 100, 130, 120, 15, DUSK, SILVER);
+    drawTextC(ctx, net.conn ? "TO THE STAGE" : "BACK", IW / 2, 134, WHITE);
+    uiBtn(100, 130, 120, 15, () => { if (net.conn) mode = "stage"; else leaveNet(true); });
+    if (net.conn && mode === "net") { /* host may stay here or go perform */ }
+  } else if (net.screen === "joincode" || net.screen === "join") {
+    drawTextC(ctx, "TYPE THE HOST'S 4-CHARACTER CODE", IW / 2, 52, SILVER);
+    panel(ctx, 130, 64, 60, 18, DUSK, textInput ? ICE : SILVER);
+    drawTextC(ctx, joinInput.text + (textInput && (Math.floor(performance.now() / 400) % 2) ? "_" : ""), IW / 2, 69, WHITE, 1);
+    drawTextC(ctx, net.status, IW / 2, 92, ICE);
+    panel(ctx, 100, 130, 120, 15, DUSK, SILVER);
+    drawTextC(ctx, "BACK", IW / 2, 134, WHITE);
+    uiBtn(100, 130, 120, 15, () => leaveNet(true));
+    if (net.screen === "joincode" && joinInput.text.length === 4 && !textInput) startJoin(joinInput.text);
+  } else if (net.screen === "picker") {
+    drawTextC(ctx, "CONNECTED TO ROOM " + net.code, IW / 2, 46, LIME);
+    drawTextC(ctx, "PICK YOUR PUPPET", IW / 2, 58, WHITE);
+    let x = 64, y = 72;
+    for (let i = 0; i < Math.min(roster.length, 14); i++) {
+      panel(ctx, x, y, 26, 26, DUSK, SLATE);
+      ctx.drawImage(miniPortrait(roster[i]), x + 1, y + 2);
+      uiBtn(x, y, 26, 26, ((idx) => () => guestPick(roster[idx]))(i));
+      x += 28;
+      if (x > 228) { x = 64; y += 28; }
+    }
+    panel(ctx, 100, 136, 120, 14, DUSK, SILVER);
+    drawTextC(ctx, "LEAVE ROOM", IW / 2, 139, WHITE);
+    uiBtn(100, 136, 120, 14, () => leaveNet(true));
+  }
+}
+
+/* Guest's live view: the mirrored stage, or the backstage curtain. */
+function renderNetGuest(ctx) {
+  if (net.hostBusy) {
+    ctx.drawImage(BACKDROPS[THEATER_BD].canvas, 0, 0);
+    rect(ctx, 60, 60, 200, 44, NIGHT);
+    frameRect(ctx, 60, 60, 200, 44, SAND);
+    drawTextC(ctx, "HOST IS BACKSTAGE", IW / 2, 68, SAND, 2);
+    drawTextC(ctx, "THE STAGE WILL RETURN IN A MOMENT", IW / 2, 88, SILVER);
+  } else {
+    renderScene(ctx, net.mirror, { clean: false, time: performance.now() });
+  }
+  // slim status strip
+  rect(ctx, 0, 0, IW, 11, NIGHT);
+  drawText(ctx, "ROOM " + net.code, 3, 2, ICE);
+  if (net.mySpec) drawText(ctx, "YOU: " + net.mySpec.name, 60, 2, SAND);
+  if (net.hostRec) {
+    if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - 78, 3, 5, 5, RED);
+    drawTextR(ctx, "REC", IW - 62, 2, RED);
+  }
+  if (net.cueName) drawTextR(ctx, net.cueName, IW - 88, 2, LIME);
+  panel(ctx, IW - 56, 0, 56, 11, DUSK, SLATE);
+  drawTextC(ctx, "LEAVE", IW - 28, 2, WHITE);
+  uiBtn(IW - 56, 0, 56, 11, () => leaveNet(true));
+  drawTextC(ctx, "WASD/ARROWS MOVE - SHIFT TALK - E/ENTER USE - Z X C V B FACES - T SPEAK", IW / 2, IH - 8, SILVER);
+  renderTypedBubble(ctx);
+}
+
+/* Guest one-shot keys (movement/talk go through the mask in guestTick). */
+function netGuestKey(code) {
+  if (code === "KeyE" || code === "Enter") { netSend({ a: "use" }); return true; }
+  for (const name of ["WASD", "ARROWS"]) {
+    const kind = EXPR_KEYS[name] && EXPR_KEYS[name][code];
+    if (kind) { netSend({ a: "expr", kind }); return true; }
+  }
+  if (code === "KeyT") {
+    typedBubble.active = true;
+    typedBubble.text = "";
+    typedBubble.target = null;
+    textInput = { tag: "bubble", max: 60,
+      get: () => typedBubble.text, set: (v) => { typedBubble.text = v; },
+      onEnter: () => { typedBubble.active = false; const t = typedBubble.text.trim(); if (t) netSend({ a: "bub", text: t }); },
+      onCancel: () => { typedBubble.active = false; } };
+    return true;
+  }
+  if (code === "Escape") { leaveNet(true); return true; }
+  return false;
+}
+
+/* Badge override for mirrored puppets (they have no local scheme). */
+function netBadgeLabel(p) { return p.netBadge || ""; }
+/* ============================================================================
    MAIN — fixed-timestep update loop, mouse/key routing, boot.
    The same STEP drives live performance, playback and export, so all three
    run at identical speed.
@@ -4368,6 +4846,7 @@ let mode = "stage";   // "stage" | "builder" | "playback" | "export"
 /* ---- one fixed step ----------------------------------------------------- */
 function update(dt) {
   updateMicAmp();
+  netTick(dt);
 
   if (mode === "stage") {
     // keyboard-driven puppets (all schemes work simultaneously); a boarded
@@ -4447,6 +4926,12 @@ function render(frameDt) {
   } else if (mode === "music") {
     renderMusicEd(sctx);
     renderToast(sctx);
+  } else if (mode === "net") {
+    renderNet(sctx);
+    renderToast(sctx);
+  } else if (mode === "net-guest") {
+    renderNetGuest(sctx);
+    renderToast(sctx);
   } else if (mode === "stage") {
     renderScene(sctx, live, { clean: false });
     if (live.puppets.length === 0 && !recording) {
@@ -4489,7 +4974,8 @@ function onMouseDown(x, y) {
     hitUI(x, y);                  // ...unless the click re-focuses it
     return;
   }
-  if (mode === "title" || mode === "library" || mode === "playback" || mode === "export" || mode === "music") {
+  if (mode === "title" || mode === "library" || mode === "playback" || mode === "export"
+      || mode === "music" || mode === "net" || mode === "net-guest") {
     if (mode === "music") textInput = null;   // clicking blurs the name field
     hitUI(x, y);
     return;
@@ -4531,7 +5017,10 @@ function useAction(p) {
   if (v) { boardVehicle(p, v); return; }
   const w = propNear(live, p);                 // kick / break / open / rustle...
   if (w && interactProp(p, w)) return;
-  if (spawnAbility(live, p) && recording) recEvent({ type: "ability", id: p.id });
+  if (spawnAbility(live, p)) {
+    if (recording) recEvent({ type: "ability", id: p.id });
+    netFX({ kind: "ability", id: p.id });
+  }
 }
 function onMouseMove(x, y) {
   if (scrubbing && mode === "playback") scrubTo(x);
@@ -4543,6 +5032,8 @@ function onMouseUp() {
 
 /* ---- one-shot keys ------------------------------------------------------ */
 function onKeyPressed(code) {
+  if (mode === "net-guest") { netGuestKey(code); return; }
+  if (mode === "net" && code === "Escape") { leaveNet(true); return; }
   if (code === "KeyH" && (mode === "stage")) helpOpen = !helpOpen;
   // item ability / vehicle boarding, per control scheme
   if (mode === "stage" && !textInput) {
