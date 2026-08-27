@@ -1392,10 +1392,13 @@ function drawPuppet(ctx, p, opts) {
 
   // z order: left arm, left leg+shoe, right leg+shoe, torso, head, jaw,
   //          face, hair, hat, right arm, item.
-  // EXCEPTION: while the leading arm's pose frame is in the BACK half of its
-  // swing it passes BEHIND the body (drawn early, occluded by torso and legs)
-  // instead of sweeping across the front — the held item travels with it.
+  // SWING DEPTH: each arm passes BEHIND the body during the back half of its
+  // swing and IN FRONT of the torso during the forward half — the leading
+  // (near) arm ducks behind on frames 3-4, the trailing (far) arm surfaces
+  // in front on frames 0-1. Anti-phase arms mean they never collide in the
+  // same layer. The held item travels with the leading arm.
   const armRBehind = f.armR >= 3 && p.useT <= 0;
+  const armLFront = f.armL <= 1;
   const drawFrontArm = () => {
     armR.draw();
     if (P.item) {
@@ -1403,7 +1406,7 @@ function drawPuppet(ctx, p, opts) {
       acc(blitPart(ctx, P.item.spr, x, y, hx - P.item.ax, hy - P.item.ay, fc));
     }
   };
-  armL.draw();
+  if (!armLFront) armL.draw();
   if (armRBehind) drawFrontArm();
   if (!opts.seated) {
     legL.draw();
@@ -1427,6 +1430,7 @@ function drawPuppet(ctx, p, opts) {
   acc(blitPart(ctx, face, x, y, RIG.faceDx, RIG.head.oy + RIG.faceDy + bob, fc));
   if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, RIG.head.ox, RIG.head.oy + P.hair.dy + bob, fc));
   if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, RIG.head.ox, RIG.head.oy + P.hat.dy + bob, fc));
+  if (armLFront) armL.draw();
   if (!armRBehind) drawFrontArm();
   p.bbox = { x: bx0, y: by0, w: bx1 - bx0, h: by1 - by0 };
 }
