@@ -2900,16 +2900,32 @@ function stepPlayback(dt) {
 const EXPORT_SCALE = 4;
 let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType}
 
+/* Container preference: MP4 with H.264+AAC first (plays everywhere, including
+   QuickTime/iMovie — an .m4v is this same container renamed), then webm. */
+const EXPORT_FORMATS = [
+  ["video/mp4;codecs=avc1.640028,mp4a.40.2", "mp4"],
+  ["video/mp4;codecs=avc1.42E01E,mp4a.40.2", "mp4"],
+  ["video/mp4", "mp4"],
+  ["video/webm;codecs=vp9,opus", "webm"],
+  ["video/webm", "webm"]
+];
+
 function startExport(t, returnTo, isRetry) {
   if (!t || exporter) return;
   const [cv, cx] = makeCanvas(IW * EXPORT_SCALE, IH * EXPORT_SCALE);
-  let mimeType = "";
+  let mimeType = "", ext = "webm";
   if (window.MediaRecorder) {
-    if (MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")) mimeType = "video/webm;codecs=vp9,opus";
-    else if (MediaRecorder.isTypeSupported("video/webm")) mimeType = "video/webm";
+    // A retry after an empty result skips MP4: some browsers claim mp4
+    // support but silently encode nothing, and webm always works.
+    const candidates = isRetry ? EXPORT_FORMATS.filter(f => f[1] === "webm") : EXPORT_FORMATS;
+    for (const [mt, ex2] of candidates) {
+      if (MediaRecorder.isTypeSupported(mt)) { mimeType = mt; ext = ex2; break; }
+    }
+    if (!mimeType) return;
   } else {
     return; // no MediaRecorder: export unavailable
   }
+  if (!isRetry) toast(ext === "mp4" ? "EXPORTING MP4..." : "EXPORTING WEBM (THIS BROWSER CAN'T WRITE MP4)");
   const stream = cv.captureStream(30);
   let audioEl = null, dest = null;
   if (t.audioURL || t.trackData) {
@@ -2926,7 +2942,7 @@ function startExport(t, returnTo, isRetry) {
   }
   if (t.trackData) playTrack(t.trackData, { outs: [dest] });   // silent locally
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType,
+  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType, ext,
                take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
   exporter = ex;
   recorder.ondataavailable = (e) => { if (e.data.size) ex.chunks.push(e.data); };
@@ -2981,10 +2997,10 @@ function deliverExport(ex) {
   }
   const blob = new Blob(ex.chunks, { type: ex.mimeType || "video/webm" });
   const url = URL.createObjectURL(blob);
-  // download puppet-show.webm
+  const fname = "puppet-show." + (ex.ext || "webm");
   const a = document.createElement("a");
   a.href = url;
-  a.download = "puppet-show.webm";
+  a.download = fname;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -3000,9 +3016,10 @@ function deliverExport(ex) {
   closeBtn.onclick = () => { overlay.classList.remove("open"); video.pause(); };
   saveBtn.onclick = () => {
     const a2 = document.createElement("a");
-    a2.href = url; a2.download = "puppet-show.webm";
+    a2.href = url; a2.download = fname;
     document.body.appendChild(a2); a2.click(); a2.remove();
   };
+  toast("SAVED " + fname.toUpperCase());
 }
 /* ============================================================================
    ROSTER + PERSISTENCE — characters are saved as JSON only: slot ids and
