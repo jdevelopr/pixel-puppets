@@ -802,6 +802,37 @@ const ITEM_OPTIONS = [
     ".3c"] }
 ];
 
+/* FACIAL EXPRESSIONS — triggered by hotkeys (P1: Z X C V B, P2: I J K L U),
+   they override the eyes and mouth for EXPR_MS, then fade back to neutral.
+   face: replaces the face option art; mouth: replaces the jaw (laugh instead
+   flaps the ordinary jaw frames); fx: a particle effect while active.      */
+const EXPR_MS = 2600;
+const EXPRESSIONS = {
+  cry: {
+    face: ["..00..00..", "..b....b.."],           // shut lids + welling tears
+    mouth: [".00.", "0..0"],                       // frown arch
+    fx: "tears"
+  },
+  angry: {
+    face: [".0......0.", "..0....0..", "..0....0.."],  // V brows over eyes
+    mouth: ["0000", "cccc", "0000"],               // gritted teeth
+    fx: "steam"
+  },
+  happy: {
+    face: ["...0...0..", "..0.0.0.0."],            // ^ ^ eyes
+    mouth: ["0..0", ".00."]                        // smile
+  },
+  laugh: {
+    face: ["..00..00..", ".........."],            // squeezed shut
+    laugh: true,                                   // flap the jaw open/wide
+    fx: "ha"
+  },
+  disgust: {
+    face: ["..00..0...", ".......0.."],            // squint + raised brow
+    mouth: ["0000", "0110", ".555"]                // tongue out
+  }
+};
+
 /* Jaw states drawn over the chin: 0 closed, 1 open, 2 wide. '1'=mouth dark,
    '2'=tongue. Positioned at (mouth offset) from the head top-left.         */
 const JAW_SPRITES = [
@@ -1286,6 +1317,8 @@ class Puppet {
     this.jaw = 0;                       // 0 closed / 1 open / 2 wide
     this.useT = 0;                      // >0: front arm raised (item ability)
     this.hitT = 0;                      // >0: reaction hop after being hit
+    this.expression = null;             // active expression key (see EXPRESSIONS)
+    this.exprT = 0;                     // remaining expression time
     this.abilityAt = 0;                 // last ability time (cooldown)
     this.vehicle = null;                // id of the vehicle this puppet drives
     this.bbox = { x: 0, y: 0, w: 0, h: 0 };
@@ -1317,6 +1350,7 @@ class Puppet {
     if (this.blinkHold > 0) this.blinkHold -= dt;
     if (this.useT > 0) this.useT -= dt;
     if (this.hitT > 0) this.hitT -= dt;
+    if (this.exprT > 0) { this.exprT -= dt; if (this.exprT <= 0) this.expression = null; }
   }
 
   frames() {
@@ -1367,8 +1401,17 @@ function drawPuppet(ctx, p, opts) {
   }
   acc(blitPart(ctx, P.torso, x, y, RIG.torso.ox, RIG.torso.oy, fc));
   acc(blitPart(ctx, P.head, x, y, RIG.head.ox, RIG.head.oy + bob, fc));
-  acc(blitPart(ctx, P.jaws[p.jaw], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
-  const face = (p.blinkHold > 0) ? P.faceClosed : P.faceOpen;
+  // an active expression overrides both the mouth and the eyes
+  const expr = (p.exprT > 0 && p.expression) ? EXPRESSIONS[p.expression] : null;
+  if (expr && expr.laugh) {
+    acc(blitPart(ctx, P.jaws[1 + (Math.floor(p.exprT / 140) % 2)], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
+  } else if (expr && expr.mouth) {
+    acc(blitPart(ctx, sprite(expr.mouth, {}), x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
+  } else {
+    acc(blitPart(ctx, P.jaws[p.jaw], x, y, RIG.mouthDx, RIG.mouthDy + bob, fc));
+  }
+  const face = expr ? sprite(expr.face, {})
+                    : ((p.blinkHold > 0) ? P.faceClosed : P.faceOpen);
   acc(blitPart(ctx, face, x, y, RIG.faceDx, RIG.head.oy + RIG.faceDy + bob, fc));
   if (P.hair) acc(blitPart(ctx, P.hair.spr, x, y, RIG.head.ox, RIG.head.oy + P.hair.dy + bob, fc));
   if (P.hat) acc(blitPart(ctx, P.hat.spr, x, y, RIG.head.ox, RIG.head.oy + P.hat.dy + bob, fc));
@@ -1491,6 +1534,27 @@ function spawnAbility(state, p) {
    and during export. */
 function updateEffects(state, dt) {
   const fx = state.effects;
+  // expression side-effects: tears, anger steam, "HA!" bursts — spawned on a
+  // timer derived from the expression countdown, so live and playback match
+  for (const p of state.puppets) {
+    if (!(p.exprT > 0) || !p.expression) continue;
+    const ex = EXPRESSIONS[p.expression];
+    if (!ex || !ex.fx) continue;
+    const iv = ex.fx === "ha" ? 360 : 180;
+    if (Math.floor(p.exprT / iv) === Math.floor((p.exprT + dt) / iv)) continue;
+    if (ex.fx === "tears") {
+      const side = (Math.floor(p.exprT / iv) % 2) ? -2 : 3;
+      fx.push({ t: "px", x: p.x + (p.facing >= 0 ? side : -side), y: p.y - 25,
+                vx: 0, vy: 0.55, g: 0.04, ttl: 520, ci: ICE });
+    } else if (ex.fx === "steam") {
+      fx.push({ t: "px", x: p.x - 4 + Math.floor(Math.random() * 9), y: p.y - 36,
+                vx: (Math.random() - 0.5) * 0.4, vy: -0.5, g: 0, ttl: 380,
+                ci: Math.random() < 0.5 ? RED : WHITE });
+    } else if (ex.fx === "ha") {
+      fx.push({ t: "txt", x: p.x + p.facing * 8, y: p.y - 34, vx: p.facing * 0.4,
+                vy: -0.35, ttl: 620, ch: "HA", ci: SAND });
+    }
+  }
   for (let i = fx.length - 1; i >= 0; i--) {
     const e = fx[i];
     if (e.t === "proj") {
@@ -2471,16 +2535,22 @@ function cueMusic(track) {
 
 const SCHEMES = {
   WASD:   { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", talk: "ShiftLeft",  use: "KeyE",  label: "WASD" },
-  ARROWS: { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", talk: "ShiftRight", use: "Enter", label: "ARWS" },
-  IJKL:   { left: "KeyJ", right: "KeyL", up: "KeyI", down: "KeyK", talk: "Slash",     use: "KeyU",  label: "IJKL" }
+  ARROWS: { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", talk: "ShiftRight", use: "Enter", label: "ARWS" }
 };
-const SCHEME_NAMES = ["WASD", "ARROWS", "IJKL"];
+const SCHEME_NAMES = ["WASD", "ARROWS"];
+
+/* Facial expression hotkeys, one row per player (the old third controller's
+   IJKL cluster now belongs to player 2's expressions). */
+const EXPR_KEYS = {
+  WASD:   { KeyZ: "cry", KeyX: "angry", KeyC: "happy", KeyV: "laugh", KeyB: "disgust" },
+  ARROWS: { KeyI: "cry", KeyJ: "angry", KeyK: "happy", KeyL: "laugh", KeyU: "disgust" }
+};
 
 const held = new Set();          // e.code of every currently-held key
 let talkStack = [];              // scheme names, in press order (last = active)
 let textInput = null;            // {get,set,max} — routes typing when focused
 
-const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash", "Space", "Enter"]);
+const PREVENT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space", "Enter"]);
 
 window.addEventListener("keydown", (e) => {
   if (textInput) {                       // a canvas text field has focus
@@ -2605,6 +2675,8 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
                                          event lands mid-wipe, ~350ms later)
      music    {trackData}                music cue: start this embedded track
                                          here (null = stop the music)
+     expr     {id, kind}                 facial expression (cry/angry/happy/
+                                         laugh/disgust), shown for EXPR_MS
    Props share the id space and the pos/layer/remove event types with
    puppets. Ability effects are transient eye-candy: they are re-spawned
    from ability events during playback, never stored as pixels.
@@ -2908,6 +2980,15 @@ function applyEvent(ev) {
     case "weather": play.weather = ev.kind; break;
     case "wipe": play.wipeAt = ev.t; break;   // rendered from show-time
     case "music": play.musicEv = ev.trackData ? ev : null; break;
+    case "expr": {
+      const p = findPlayPuppet(ev.id);
+      if (p) {
+        // on a seek, only whatever of the expression window remains
+        p.exprT = Math.max(0, EXPR_MS - (playbackClock() - ev.t));
+        p.expression = p.exprT > 0 ? ev.kind : null;
+      }
+      break;
+    }
   }
 }
 
@@ -3867,13 +3948,13 @@ function renderSelectionPanel(ctx) {
     let bx = x0 + 4;
     for (const name of SCHEME_NAMES) {
       const on = p.scheme === name;
-      const w = 22;
+      const w = 33;
       panel(ctx, bx, y0 + 19, w, 11, on ? BLUE : DUSK, on ? ICE : SLATE);
       drawTextC(ctx, SCHEMES[name].label, bx + w / 2, y0 + 21, WHITE);
       uiBtn(bx, y0 + 19, w, 11, ((n, was) => () => {
         if (was) p.scheme = null; else assignScheme(live.puppets, p, n);
       })(name, on));
-      bx += 23;
+      bx += 35;
     }
     ry = y0 + 32;
   } else {
@@ -4021,21 +4102,21 @@ function renderHelp(ctx) {
   panel(ctx, 40, 24, 240, 132, NIGHT, ICE);
   drawTextC(ctx, "HOW TO PLAY", IW / 2, 30, WHITE, 2);
   const lines = [
-    ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE"],
-    ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE"],
-    ["PLAYER 3", "IJKL MOVE", "/ TALK", "U USE"]
+    ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE", "Z X C V B"],
+    ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE", "I J K L U"]
   ];
   let y = 52;
-  for (const [who, mv, talk, use] of lines) {
+  for (const [who, mv, talk, use, ex] of lines) {
     drawText(ctx, who, 48, y, SAND);
-    drawText(ctx, mv, 104, y, WHITE);
-    drawText(ctx, talk, 172, y, ICE);
-    drawText(ctx, use, 236, y, LIME);
-    y += 12;
+    drawText(ctx, mv, 96, y, WHITE);
+    drawText(ctx, talk, 152, y, ICE);
+    drawText(ctx, use, 212, y, LIME);
+    drawText(ctx, ex, 48, y + 9, ORANGE);
+    drawText(ctx, "= CRY ANGRY HAPPY LAUGH DISGUST", 100, y + 9, SILVER);
+    y += 20;
   }
-  y += 4;
-  drawText(ctx, "USE FIRES YOUR ITEM - STAFF, BOW, SWORD...", 48, y, SILVER); y += 9;
-  drawText(ctx, "USE BY A CAR/UFO RIDES - BY PROPS KICKS", 48, y, SILVER); y += 9;
+  y += 2;
+  drawText(ctx, "USE FIRES YOUR ITEM, RIDES CARS, KICKS PROPS", 48, y, SILVER); y += 9;
   drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 9;
   drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
   drawText(ctx, "1-8 = CUE MUSIC LIVE, 0 = STOP THE MUSIC", 48, y, SILVER); y += 9;
@@ -4169,7 +4250,7 @@ function renderTitle(ctx) {
     uiBtn(x, y, w, 15, cb);
     y += 18;
   }
-  drawTextC(ctx, "UP TO 3 PLAYERS ON ONE KEYBOARD", IW / 2, 133, SILVER);
+  drawTextC(ctx, "2 PLAYERS ON ONE KEYBOARD - VOICES, FACES + MUSIC", IW / 2, 133, SILVER);
 }
 
 /* ---- Library ------------------------------------------------------------ */
@@ -4381,6 +4462,13 @@ function onMouseDown(x, y) {
   selected = null;
 }
 
+/* Trigger a facial expression (recorded to the timeline like everything). */
+function exprAction(p, kind) {
+  p.expression = kind;
+  p.exprT = EXPR_MS;
+  if (recording) recEvent({ type: "expr", id: p.id, kind });
+}
+
 /* USE for one puppet: exit/enter a nearby vehicle, else fire the held item.
    Live-only; playback regenerates the same things from recorded events. */
 function useAction(p) {
@@ -4421,6 +4509,17 @@ function onKeyPressed(code) {
       const target = (selected && !selected.isProp && live.puppets.includes(selected)) ? selected
                    : live.puppets[0];
       if (target) openTypedBubble(target);
+    }
+    // facial expression hotkeys, per player (fallback: P1 keys drive the
+    // selected puppet when nobody has the WASD controller)
+    for (const name of SCHEME_NAMES) {
+      const kind = EXPR_KEYS[name] && EXPR_KEYS[name][code];
+      if (!kind) continue;
+      let target = null;
+      for (const p of live.puppets) if (p.scheme === name) target = p;
+      if (!target && name === "WASD" && selected && !selected.isProp && live.puppets.includes(selected))
+        target = selected;
+      if (target) exprAction(target, kind);
     }
     // music cue hotkeys: 1-8 start a track (same again stops), 0 stops
     if (code === "Digit0") cueMusic(null);
