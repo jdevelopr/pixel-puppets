@@ -3641,6 +3641,69 @@ function prebuiltRoster() {
 let roster = [];
 const STORE_KEY = "pixelPuppetsRoster.v1";
 
+/* ---- FAVORITES ----------------------------------------------------------
+   The stage drawer is one strip 44px tall: it can show six characters and
+   no more. So the roster can grow to any size, and `fav` picks the six that
+   ride along on the stage. Everything else lives on the ALL PUPPETS page,
+   one click away. `fav` is part of the saved character, so favorites survive
+   a reload and travel with an exported roster file.
+   ========================================================================*/
+const MAX_FAVS = 6;
+
+function favCount() { let n = 0; for (const c of roster) if (c.fav) n++; return n; }
+
+/* The favorites in roster order, with their roster index (EDIT needs it). */
+function favList() {
+  const out = [];
+  for (let i = 0; i < roster.length && out.length < MAX_FAVS; i++)
+    if (roster[i].fav) out.push({ spec: roster[i], idx: i });
+  return out;
+}
+
+/* A roster with no favorites flagged at all — a fresh install, a roster
+   saved before favorites existed, or an imported .json — favorites the
+   first six in order, which is exactly what the drawer used to show. Also
+   trims any file that claims more than six. */
+function normalizeFavs() {
+  if (!roster.some(c => c.fav)) { roster.forEach((c, i) => { c.fav = i < MAX_FAVS; }); return; }
+  let n = 0;
+  for (const c of roster) { if (!c.fav) continue; if (n < MAX_FAVS) n++; else c.fav = false; }
+}
+
+/* Promote characters in roster order into any free favorite slots. Used
+   when a favorite is deleted and when a brand-new character is saved — never
+   when someone deliberately unstars one. */
+function fillFavs() {
+  for (let i = 0; i < roster.length && favCount() < MAX_FAVS; i++)
+    if (!roster[i].fav) roster[i].fav = true;
+}
+
+function toggleFav(i) {
+  const c = roster[i];
+  if (c.fav) { c.fav = false; saveRoster(); toast(c.name + " OFF THE STAGE DRAWER"); return; }
+  if (favCount() >= MAX_FAVS) { toast("6 FAVORITES MAX - UNFAV ONE FIRST"); return; }
+  c.fav = true; saveRoster(); toast(c.name + " ADDED TO THE STAGE DRAWER");
+}
+
+function copyRosterChar(i) {
+  const copy = JSON.parse(JSON.stringify(roster[i]));
+  copy.name = (copy.name + " 2").slice(0, 14);
+  copy.fav = false;
+  roster.splice(i + 1, 0, copy);
+  saveRoster();
+  toast("COPIED AS " + copy.name);
+}
+
+function deleteRosterChar(i) {
+  if (roster.length <= 1) { toast("KEEP AT LEAST ONE PUPPET"); return; }
+  const name = roster[i].name;
+  roster.splice(i, 1);
+  fillFavs();                 // a deleted favorite frees a stage slot
+  saveRoster();
+  rosterPage.confirmDel = -1;
+  toast("DELETED " + name);
+}
+
 function storageAvailable() {
   try {
     const t = "__pp_test__";
@@ -3653,7 +3716,7 @@ const canStore = storageAvailable();
 
 function saveRoster() {
   if (!canStore) return;
-  try { window.localStorage.setItem(STORE_KEY, JSON.stringify({ version: 2, characters: roster })); }
+  try { window.localStorage.setItem(STORE_KEY, JSON.stringify({ version: 3, characters: roster })); }
   catch (e) { /* quota or privacy mode: stay in-memory */ }
 }
 function loadRoster() {
@@ -3663,18 +3726,24 @@ function loadRoster() {
       if (raw) {
         const data = JSON.parse(raw);
         if (data && Array.isArray(data.characters) && data.characters.length) {
-          roster = data.characters.map(c => makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {}));
+          roster = data.characters.map(c => {
+            const sp = makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {});
+            if (c.fav) sp.fav = true;
+            return sp;
+          });
           // one-time upgrade: rosters saved before v2 gain the princess
           if ((data.version || 1) < 2) {
             if (!roster.some(c => c.slots.torso === "gown")) roster.unshift(princessSpec());
-            saveRoster();
           }
+          normalizeFavs();
+          if ((data.version || 1) < 3) saveRoster();
           return;
         }
       }
     } catch (e) { /* corrupted store: fall through to defaults */ }
   }
   roster = prebuiltRoster();
+  normalizeFavs();
   saveRoster();
 }
 
@@ -3700,8 +3769,14 @@ function importRosterFile() {
         const data = JSON.parse(reader.result);
         const chars = Array.isArray(data) ? data : data.characters;
         if (Array.isArray(chars) && chars.length) {
-          roster = chars.map(c => makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {}));
+          roster = chars.map(c => {
+            const sp = makeSpec(c.name || "PUPPET", c.slots || {}, c.colors || {});
+            if (c.fav) sp.fav = true;
+            return sp;
+          });
+          normalizeFavs();
           saveRoster();
+          rosterPage.scroll = 0;
           toast("ROSTER IMPORTED: " + roster.length + " PUPPETS");
         } else toast("NOT A ROSTER FILE");
       } catch (e) { toast("COULD NOT READ FILE"); }
@@ -3832,6 +3907,91 @@ function scenesFromRecord(rec) {
 }
 function recTitle(rec) { return (rec.title && rec.title.length) ? rec.title : rec.name; }
 /* ============================================================================
+   ALL PUPPETS — the whole roster, however big it gets. The stage drawer only
+   has room for six, so this is where the rest live: star six as favorites to
+   choose which six ride along on the stage, drop any character straight into
+   the scene, and edit, copy or delete without hunting through the drawer.
+   ==========================================================================*/
+
+const rosterPage = { scroll: 0, confirmDel: -1, confirmAt: 0, returnTo: "stage" };
+const RP_ROWS = 6;
+
+function enterRosterPage() {
+  // coming from the builder, BACK should land where the builder would have
+  let back = (mode === "builder") ? (builder.returnTo || "stage") : mode;
+  if (back === "roster" || back === "builder") back = "stage";
+  rosterPage.returnTo = back;
+  rosterPage.confirmDel = -1;
+  textInput = null;
+  mode = "roster";
+}
+function exitRosterPage() { mode = rosterPage.returnTo || "stage"; }
+
+function renderRosterPage(ctx) {
+  rect(ctx, 0, 0, IW, IH, NAVY);
+  rect(ctx, 0, 0, IW, 16, NIGHT);
+  drawTextC(ctx, "ALL PUPPETS", IW / 2, 1, WHITE, 2);
+  panel(ctx, 4, 2, 34, 12, DUSK, SLATE);
+  drawText(ctx, "BACK", 9, 5, WHITE);
+  uiBtn(4, 2, 34, 12, () => exitRosterPage());
+  panel(ctx, IW - 38, 2, 34, 12, DUSK, LIME);
+  drawTextC(ctx, "NEW", IW - 21, 5, LIME);
+  uiBtn(IW - 38, 2, 34, 12, () => enterBuilder(-1));
+
+  rosterPage.scroll = clamp(rosterPage.scroll, 0, Math.max(0, roster.length - RP_ROWS));
+  const end = Math.min(roster.length, rosterPage.scroll + RP_ROWS);
+  let y = 19;
+  for (let i = rosterPage.scroll; i < end; i++) {
+    const spec = roster[i];
+    const fav = !!spec.fav;
+    panel(ctx, 4, y, IW - 8, 22, fav ? DUSK : NIGHT, fav ? SAND : SLATE);
+    // the portrait is 24x22 (head + torso); crop 2px so it sits in the row
+    ctx.drawImage(miniPortrait(spec), 0, 0, 24, 20, 6, y + 1, 24, 20);
+    drawText(ctx, spec.name.slice(0, 14), 33, y + 7, fav ? WHITE : SILVER);
+    const arming = rosterPage.confirmDel === i && performance.now() < rosterPage.confirmAt;
+    const btns = [
+      [fav ? "UNFAV" : "FAV", fav ? SAND : SLATE, fav, () => toggleFav(i)],
+      ["ADD", LIME, false, () => {
+        selected = spawnPuppet(roster[i]);
+        drawerOpen = true;
+        mode = "stage";
+        toast("ADDED " + roster[i].name);
+      }],
+      ["EDIT", ICE, false, () => enterBuilder(i)],
+      ["COPY", SILVER, false, () => copyRosterChar(i)],
+      [arming ? "SURE?" : "DEL", RED, arming, () => {
+        if (arming) deleteRosterChar(i);
+        else { rosterPage.confirmDel = i; rosterPage.confirmAt = performance.now() + 3500; }
+      }]
+    ];
+    // laid out right to left so the name gets whatever room is left over
+    let bx = IW - 8;
+    for (let k = btns.length - 1; k >= 0; k--) {
+      const [label, col, on, cb] = btns[k];
+      const w = textW(label) + 8;
+      bx -= w;
+      panel(ctx, bx, y + 5, w, 12, on ? BLUE : DUSK, col);
+      drawText(ctx, label, bx + 4, y + 8, on ? WHITE : col);
+      uiBtn(bx, y + 5, w, 12, cb);
+      bx -= 4;
+    }
+    y += 23;
+  }
+
+  const fy = 160;
+  rect(ctx, 0, fy, IW, IH - fy, NIGHT);
+  if (roster.length > RP_ROWS) {
+    panel(ctx, 4, fy + 3, 24, 12, DUSK, SLATE);
+    drawTextC(ctx, "UP", 16, fy + 6, WHITE);
+    uiBtn(4, fy + 3, 24, 12, () => { rosterPage.scroll = Math.max(0, rosterPage.scroll - 1); });
+    panel(ctx, 31, fy + 3, 30, 12, DUSK, SLATE);
+    drawTextC(ctx, "DOWN", 46, fy + 6, WHITE);
+    uiBtn(31, fy + 3, 30, 12, () => { rosterPage.scroll++; });
+    drawText(ctx, (rosterPage.scroll + 1) + "-" + end + " OF " + roster.length, 66, fy + 6, SILVER);
+  }
+  drawTextR(ctx, "FAV = ON THE STAGE DRAWER (" + favCount() + "/" + MAX_FAVS + ")", IW - 4, fy + 6, SAND);
+}
+/* ============================================================================
    CHARACTER BUILDER — assemble a character from costume slots. Every option
    is recolored by remapping palette indices (see remapFor); the preview is a
    real Puppet walking in place with the mouth cycling, so what you see is
@@ -3853,7 +4013,7 @@ function rebuildPreview() {
 }
 
 function enterBuilder(rosterIndex) {
-  builder.returnTo = (mode === "title") ? "title" : "stage";
+  builder.returnTo = (mode === "title") ? "title" : (mode === "roster") ? "roster" : "stage";
   mode = "builder";
   builder.editIndex = rosterIndex;
   builder.spec = rosterIndex >= 0
@@ -3868,16 +4028,28 @@ function exitBuilder() { textInput = null; titleParade = []; mode = builder.retu
 function builderSave() {
   const b = builder;
   if (!b.spec.name.trim()) b.spec.name = "PUPPET";
-  if (b.editIndex >= 0) roster[b.editIndex] = JSON.parse(JSON.stringify(b.spec));
-  else { roster.push(JSON.parse(JSON.stringify(b.spec))); b.editIndex = roster.length - 1; }
+  if (b.editIndex >= 0) {
+    const wasFav = !!roster[b.editIndex].fav;   // editing never restars
+    roster[b.editIndex] = JSON.parse(JSON.stringify(b.spec));
+    roster[b.editIndex].fav = wasFav;
+  } else {
+    const fresh = JSON.parse(JSON.stringify(b.spec));
+    fresh.fav = false;
+    roster.push(fresh);
+    b.editIndex = roster.length - 1;
+    fillFavs();      // takes a free drawer slot if there is one
+  }
   saveRoster();
-  toast("SAVED " + b.spec.name);
+  toast(roster[b.editIndex].fav ? "SAVED " + b.spec.name
+                                : "SAVED - FIND IT IN ALL PUPPETS");
   b.dirty = false;
 }
 
 function builderDelete() {
   if (builder.editIndex >= 0) {
+    if (roster.length <= 1) { toast("KEEP AT LEAST ONE PUPPET"); return; }
     roster.splice(builder.editIndex, 1);
+    fillFavs();
     saveRoster();
     toast("DELETED");
   }
@@ -3904,6 +4076,9 @@ function renderBuilder(ctx, dt) {
   rect(ctx, 0, 0, IW, IH, NAVY);
   rect(ctx, 0, 0, IW, 14, NIGHT);
   drawTextC(ctx, "CHARACTER BUILDER", IW / 2, 0, WHITE, 2);
+  panel(ctx, 4, 2, 62, 11, DUSK, ICE);
+  drawTextC(ctx, "ALL PUPPETS", 35, 4, WHITE);
+  uiBtn(4, 2, 62, 11, () => enterRosterPage());
 
   // ---- live preview ----
   panel(ctx, 10, 22, 92, 104, DUSK, SILVER);
@@ -4265,6 +4440,7 @@ function renderDrawer(ctx) {
     drawTextC(ctx, label, tx + tw / 2, y0 + 2, on ? WHITE : SILVER);
     uiBtn(tx, y0, tw, 10, () => { drawerTab = tab; });
   }
+  // room for ~18 characters before the SCENE thumbnails: keep it short
   drawText(ctx, "CLICK TO ADD", 122, y0 + 2, SILVER);
   panel(ctx, IW - 34, y0, 34, 10, DUSK, SILVER);
   drawText(ctx, "HIDE", IW - 28, y0 + 2, WHITE);
@@ -4273,31 +4449,34 @@ function renderDrawer(ctx) {
   let x = 4;
   const cy = y0 + 11;
   if (drawerTab === "cast") {
-    // roster cells: a mini live portrait of each character
-    for (let i = 0; i < roster.length && x < IW - 110; i++) {
-      const spec = roster[i];
+    // the six favorites, as mini live portraits. The strip is only 44px tall,
+    // so the rest of the roster lives on the ALL PUPPETS page rather than
+    // running off the end of the drawer.
+    for (const { spec, idx } of favList()) {
       panel(ctx, x, cy, 26, 24, DUSK, SLATE);
-      const mini = miniPortrait(spec);
-      ctx.drawImage(mini, x + 1, cy + 1);
-      uiBtn(x, cy, 26, 24, ((idx) => () => {
-        const p = spawnPuppet(roster[idx]);
-        selected = p;
-        toast("ADDED " + roster[idx].name);
-      })(i));
+      ctx.drawImage(miniPortrait(spec), x + 1, cy + 1);
+      uiBtn(x, cy, 26, 24, ((k) => () => {
+        selected = spawnPuppet(roster[k]);
+        toast("ADDED " + roster[k].name);
+      })(idx));
       if (!recording) {   // no costume edits mid-take
         panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
         drawTextC(ctx, "EDIT", x + 13, cy + 26, WHITE);
-        uiBtn(x, cy + 25, 26, 8, ((idx) => () => enterBuilder(idx))(i));
+        uiBtn(x, cy + 25, 26, 8, ((k) => () => enterBuilder(k))(idx));
       }
       x += 28;
     }
-    // new character cell
+    // ALL / NEW column — leaving the stage mid-take would strand the
+    // recording, so like EDIT these are hidden while the tape is rolling
     if (!recording) {
-      panel(ctx, x, cy, 26, 24, DUSK, SLATE);
-      drawTextC(ctx, "+", x + 13, cy + 8, LIME);
-      uiBtn(x, cy, 26, 33, () => enterBuilder(-1));
-      panel(ctx, x, cy + 25, 26, 8, NAVY, SLATE);
-      drawTextC(ctx, "NEW", x + 13, cy + 26, WHITE);
+      panel(ctx, x, cy, 26, 16, DUSK, ICE);
+      drawTextC(ctx, "ALL", x + 13, cy + 1, WHITE);
+      drawTextC(ctx, String(roster.length), x + 13, cy + 8, ICE);
+      uiBtn(x, cy, 26, 16, () => enterRosterPage());
+      panel(ctx, x, cy + 17, 26, 16, DUSK, LIME);
+      drawTextC(ctx, "NEW", x + 13, cy + 18, WHITE);
+      drawTextC(ctx, "+", x + 13, cy + 25, LIME);
+      uiBtn(x, cy + 17, 26, 16, () => enterBuilder(-1));
     }
   } else if (drawerTab === "fx") {
     // weather buttons — take effect immediately and record as events
@@ -4345,7 +4524,9 @@ function renderDrawer(ctx) {
 /* Mini portrait: head+torso of a character rendered once into a 24x22 canvas. */
 const portraitCache = new Map();
 function miniPortrait(spec) {
-  const key = JSON.stringify(spec);
+  // keyed on what is actually drawn: the name and the fav flag don't change
+  // a single pixel, so toggling a favorite must not rebuild the portrait
+  const key = JSON.stringify({ s: spec.slots, c: spec.colors });
   let cv = portraitCache.get(key);
   if (cv) return cv;
   const [c, cx] = makeCanvas(24, 22);
@@ -4647,13 +4828,13 @@ function fmtTime(ms) {
 
 /* ---- Help overlay ------------------------------------------------------- */
 function renderHelp(ctx) {
-  panel(ctx, 40, 12, 240, 158, NIGHT, ICE);
-  drawTextC(ctx, "HOW TO PLAY", IW / 2, 18, WHITE, 2);
+  panel(ctx, 40, 8, 240, 166, NIGHT, ICE);
+  drawTextC(ctx, "HOW TO PLAY", IW / 2, 14, WHITE, 2);
   const lines = [
     ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE", "Z X C V B"],
     ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE", "I J K L U"]
   ];
-  let y = 38;
+  let y = 34;
   for (const [who, mv, talk, use, ex] of lines) {
     drawText(ctx, who, 48, y, SAND);
     drawText(ctx, mv, 96, y, WHITE);
@@ -4669,11 +4850,12 @@ function renderHelp(ctx) {
   drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
   drawText(ctx, "1-8 = CUE MUSIC LIVE, 0 = STOP THE MUSIC", 48, y, SILVER); y += 9;
   drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 9;
+  drawText(ctx, "DRAWER SHOWS 6 FAVORITES - ALL = WHOLE ROSTER", 48, y, SILVER); y += 9;
   drawText(ctx, "POSES P1 Q R F G Y - P2 O P [ ] ;", 48, y, ORANGE); y += 9;
   drawText(ctx, "= POINT WAVE CHEER JUMP SIT (AGAIN = STAND)", 48, y, SILVER); y += 9;
   drawText(ctx, "OVERDUB REPLAYS THE SCENE WHILE YOU ACT A NEW", 48, y, SILVER); y += 9;
   drawText(ctx, "PUPPET - USE HEADPHONES. DEL REMOVES - H CLOSES", 48, y, SILVER);
-  uiBtn(40, 12, 240, 158, () => { helpOpen = false; });
+  uiBtn(40, 8, 240, 166, () => { helpOpen = false; });
 }
 
 /* ---- Transport (playback mode) ------------------------------------------ */
@@ -5439,6 +5621,9 @@ function render(frameDt) {
   } else if (mode === "builder") {
     renderBuilder(sctx, frameDt);
     renderToast(sctx);
+  } else if (mode === "roster") {
+    renderRosterPage(sctx);
+    renderToast(sctx);
   } else if (mode === "music") {
     renderMusicEd(sctx);
     renderToast(sctx);
@@ -5490,7 +5675,7 @@ function onMouseDown(x, y) {
     return;
   }
   if (mode === "title" || mode === "library" || mode === "playback" || mode === "export"
-      || mode === "music" || mode === "net" || mode === "net-guest") {
+      || mode === "music" || mode === "net" || mode === "net-guest" || mode === "roster") {
     if (mode === "music") textInput = null;   // clicking blurs the name field
     hitUI(x, y);
     return;
@@ -5602,6 +5787,7 @@ function onKeyPressed(code) {
     else if (mode === "builder") exitBuilder();
     else if (mode === "playback") exitPlayback();
     else if (mode === "music") exitMusicEd();
+    else if (mode === "roster") exitRosterPage();
     else if (mode === "library") mode = "title";
     else selected = null;
   }
