@@ -44,8 +44,14 @@ const IW = 320, IH = 180;
 const STEP = 1000 / 60;           // fixed timestep (ms) for movement/animation
 
 /* ---- Palette ------------------------------------------------------------
-   The only 16 colors in the game (Sweetie-16). Sprite pixel data refers to
-   these by index using single hex characters '0'-'f'; '.' = transparent.   */
+   The only 32 colors in the game. 0-f are Sweetie-16, untouched, so every
+   sprite, every saved character and every recorded show still looks exactly
+   as it did. 16-31 fill the gaps that palette leaves - skin and wood tones,
+   pinks and purples, warm browns, a second family of greens.
+
+   Sprite pixel data refers to a color by ONE character, base 32: '0'-'9'
+   then 'a'-'v' ('.' = transparent). Base 32 gives '0'-'f' the same values
+   they had in hex, which is why the old art needed no rewriting.          */
 const PAL = [
   "#1a1c2c", // 0 NIGHT   (outlines, letterbox)
   "#5d275d", // 1 PLUM
@@ -62,10 +68,30 @@ const PAL = [
   "#f4f4f4", // c WHITE
   "#94b0c2", // d SILVER
   "#566c86", // e SLATE
-  "#333c57"  // f DUSK
+  "#333c57", // f DUSK
+  // ---- added colors: same muted, slightly-desaturated language ----------
+  "#ffd8b1", // g PEACH   (light skin, pale wood)
+  "#d9a066", // h TAN     (mid skin, leather, wood)
+  "#8a5a3b", // i BROWN   (deep skin, tree bark)
+  "#5a3921", // j COCOA   (darkest skin, dark wood)
+  "#ff9ec4", // k ROSE
+  "#d6459b", // l MAGENTA
+  "#7b53c9", // m VIOLET
+  "#c3a7f2", // n LILAC
+  "#7a2a45", // o WINE
+  "#c4562e", // p RUST
+  "#f0b23c", // q GOLD
+  "#fff3d0", // r CREAM
+  "#83913f", // s OLIVE
+  "#46702f", // t MOSS
+  "#8fe9b8", // u MINT
+  "#34c2b2"  // v AQUA
 ];
 const NIGHT=0, PLUM=1, RED=2, ORANGE=3, SAND=4, LIME=5, GREEN=6, TEAL=7,
-      NAVY=8, BLUE=9, SKY=10, ICE=11, WHITE=12, SILVER=13, SLATE=14, DUSK=15;
+      NAVY=8, BLUE=9, SKY=10, ICE=11, WHITE=12, SILVER=13, SLATE=14, DUSK=15,
+      PEACH=16, TAN=17, BROWN=18, COCOA=19, ROSE=20, MAGENTA=21, VIOLET=22,
+      LILAC=23, WINE=24, RUST=25, GOLD=26, CREAM=27, OLIVE=28, MOSS=29,
+      MINT=30, AQUA=31;
 const RECOLOR = BLUE;  // costume art draws its recolorable channel in this index
 const SKINC   = SAND;  // costume art draws skin in this index
 
@@ -332,7 +358,7 @@ function canvasFromRows(rows, remap) {
     for (let x = 0; x < row.length; x++) {
       const ch = row[x];
       if (ch === "." || ch === " ") continue;
-      let ci = parseInt(ch, 16);
+      let ci = parseInt(ch, 32);   // base 32: '0'-'9' then 'a'-'v'
       if (isNaN(ci)) continue;
       if (remap && remap[ci] !== undefined) ci = remap[ci];
       cx.fillStyle = PAL[ci];
@@ -4055,6 +4081,7 @@ function enterBuilder(rosterIndex) {
   builder.returnTo = (mode === "title") ? "title" : (mode === "roster") ? "roster" : "stage";
   mode = "builder";
   builder.editIndex = rosterIndex;
+  colorPick.active = false;
   builder.spec = rosterIndex >= 0
     ? JSON.parse(JSON.stringify(roster[rosterIndex]))
     : makeSpec("PUPPET " + (roster.length + 1), {}, {});
@@ -4062,7 +4089,7 @@ function enterBuilder(rosterIndex) {
   rebuildPreview();
 }
 
-function exitBuilder() { textInput = null; titleParade = []; mode = builder.returnTo || "stage"; if (mode === "title") enterTitle(); }
+function exitBuilder() { textInput = null; colorPick.active = false; titleParade = []; mode = builder.returnTo || "stage"; if (mode === "title") enterTitle(); }
 
 function builderSave() {
   const b = builder;
@@ -4104,9 +4131,45 @@ function cycleOption(slotDef, dir) {
   rebuildPreview();
 }
 function cycleColor(key, dir) {
-  builder.spec.colors[key] = ((builder.spec.colors[key] || 0) + dir + 16) % 16;
+  builder.spec.colors[key] = ((builder.spec.colors[key] || 0) + dir + PAL.length) % PAL.length;
   builder.dirty = true;
   rebuildPreview();
+}
+function setColor(key, ci) {
+  builder.spec.colors[key] = clamp(ci, 0, PAL.length - 1);
+  builder.dirty = true;
+  rebuildPreview();
+}
+
+/* ---- Palette picker ------------------------------------------------------
+   Nudging through 32 colors with the arrows would be a chore, so the swatch
+   itself opens the whole palette as a grid: one click to any color.       */
+const colorPick = { active: false, key: null };
+function openColorPick(key) { colorPick.active = true; colorPick.key = key; }
+
+function renderColorPick(ctx) {
+  if (!colorPick.active) return;
+  const COLS = 8, CW = 17, CH = 13;
+  const w = COLS * CW + 8, h = Math.ceil(PAL.length / COLS) * CH + 22;
+  const x0 = (IW - w) >> 1, y0 = (IH - h) >> 1;
+  // registered first, so every swatch below sits on top of it: a click that
+  // misses the grid closes the picker
+  uiBtn(0, 0, IW, IH, () => { colorPick.active = false; });
+  panel(ctx, x0, y0, w, h, NIGHT, ICE);
+  drawTextC(ctx, "PICK A COLOR", IW / 2, y0 + 3, WHITE);
+  const cur = builder.spec.colors[colorPick.key];
+  for (let i = 0; i < PAL.length; i++) {
+    const sx = x0 + 4 + (i % COLS) * CW, sy = y0 + 13 + Math.floor(i / COLS) * CH;
+    rect(ctx, sx, sy, CW - 2, CH - 2, i);
+    // SLATE, not NIGHT: the dark end of the palette would vanish into the panel
+    frameRect(ctx, sx, sy, CW - 2, CH - 2, i === cur ? WHITE : SLATE);
+    if (i === cur) frameRect(ctx, sx - 1, sy - 1, CW, CH, WHITE);
+    uiBtn(sx, sy, CW - 2, CH - 2, ((k) => () => {
+      setColor(colorPick.key, k);
+      colorPick.active = false;
+    })(i));
+  }
+  drawTextC(ctx, "CLICK ANYWHERE ELSE TO CLOSE", IW / 2, y0 + h - 8, SILVER);
 }
 
 /* Builder screen renderer + UI registration (immediate mode). */
@@ -4161,6 +4224,7 @@ function renderBuilder(ctx, dt) {
       uiBtn(248, y, 9, 11, () => cycleColor(sd.slot, -1));
       rect(ctx, 259, y + 1, 12, 9, b.spec.colors[sd.slot]);
       frameRect(ctx, 259, y + 1, 12, 9, NIGHT);
+      uiBtn(259, y + 1, 12, 9, ((k) => () => openColorPick(k))(sd.slot));
       panel(ctx, 273, y, 9, 11, NAVY, SILVER); drawText(ctx, ">", 276, y + 2, WHITE);
       uiBtn(273, y, 9, 11, () => cycleColor(sd.slot, 1));
     }
@@ -4172,6 +4236,7 @@ function renderBuilder(ctx, dt) {
   uiBtn(248, y, 9, 11, () => cycleColor("skin", -1));
   rect(ctx, 259, y + 1, 12, 9, b.spec.colors.skin);
   frameRect(ctx, 259, y + 1, 12, 9, NIGHT);
+  uiBtn(259, y + 1, 12, 9, () => openColorPick("skin"));
   panel(ctx, 273, y, 9, 11, NAVY, SILVER); drawText(ctx, ">", 276, y + 2, WHITE);
   uiBtn(273, y, 9, 11, () => cycleColor("skin", 1));
 
@@ -4192,7 +4257,9 @@ function renderBuilder(ctx, dt) {
     uiBtn(bx, 160, w, 13, cb);
     bx += w + 5;
   }
-  drawText(ctx, canStore ? "AUTO-SAVE ON" : "NO BROWSER STORAGE - USE EXPORT", 110, 150, SILVER);
+  drawText(ctx, canStore ? "AUTO-SAVE ON - SWATCH = ALL 32 COLORS"
+                         : "NO BROWSER STORAGE - USE EXPORT", 110, 150, SILVER);
+  renderColorPick(ctx);
 }
 /* ============================================================================
    MUSIC STUDIO — a step-sequencer screen for the chiptune tracks. Pick a
@@ -5830,6 +5897,7 @@ function onKeyPressed(code) {
   }
   if (code === "Escape") {
     if (helpOpen) helpOpen = false;
+    else if (colorPick.active) colorPick.active = false;
     else if (mode === "builder") exitBuilder();
     else if (mode === "playback") exitPlayback();
     else if (mode === "music") exitMusicEd();
