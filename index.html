@@ -520,8 +520,7 @@ const LEG_OPTIONS = [
   { id: "shorts", name: "SHORTS",  paint: (i, n) => i < 3 ? "9" : "4" },
   { id: "stripe", name: "STRIPES", paint: (i, n) => i < n - 1 ? (i % 2 ? "c" : "9") : "4" },
   { id: "armor",  name: "ARMOR",   paint: (i, n) => i < n - 1 ? (i % 2 ? "d" : "9") : "4" },
-  { id: "dots",   name: "DOTTED",  paint: (i, n) => i < n - 1 ? (i % 3 === 1 ? "c" : "9") : "4" },
-  { id: "bare",   name: "BARE",    paint: (i, n) => "4" }
+  { id: "dots",   name: "DOTTED",  paint: (i, n) => i < n - 1 ? (i % 3 === 1 ? "c" : "9") : "4" }
 ];
 
 /* ---- Static part pixel art ----------------------------------------------
@@ -947,6 +946,25 @@ const SLOT_DEFS = [
   { slot: "shoes", label: "SHOES", options: SHOE_OPTIONS,  colorable: true },
   { slot: "item",  label: "ITEM",  options: ITEM_OPTIONS,  colorable: true }
 ];
+/* ---- Skin tones -----------------------------------------------------------
+   The colors that read as bare skin. The SHIRT and LEGS slots don't offer
+   them, because a torso or a pair of trousers painted in a skin tone makes
+   the puppet look undressed rather than dressed. Every other slot - hair,
+   hat, sleeves, shoes, item - can still use them freely.
+   ==========================================================================*/
+const SKIN_TONES = [SAND, PEACH, TAN, BROWN, COCOA];
+const CLOTHED_SLOTS = { torso: true, legs: true };
+
+function colorAllowed(key, ci) {
+  return !CLOTHED_SLOTS[key] || SKIN_TONES.indexOf(ci) < 0;
+}
+/* The palette a given slot may choose from, as a list of palette indices. */
+function paletteFor(key) {
+  const out = [];
+  for (let i = 0; i < PAL.length; i++) if (colorAllowed(key, i)) out.push(i);
+  return out;
+}
+
 function optionById(list, id) {
   for (const o of list) if (o.id === id) return o;
   return list[0];
@@ -3784,8 +3802,9 @@ function makeSpec(name, slots, colors) {
 
 function princessSpec() {
   return makeSpec("PRINCESS", { head: "egg", hair: "long", hat: "crown", face: "big",
-                                torso: "gown", arms: "robe", legs: "bare", shoes: "heel", item: "none" },
-                  { skin: PEACH, hair: GOLD, hat: GOLD, torso: MAGENTA, arms: MAGENTA, shoes: GOLD });
+                                torso: "gown", arms: "robe", legs: "pants", shoes: "heel", item: "none" },
+                  { skin: PEACH, hair: GOLD, hat: GOLD, torso: MAGENTA, arms: MAGENTA,
+                    legs: WINE, shoes: GOLD });
 }
 
 /* Five pre-built characters. */
@@ -4231,11 +4250,17 @@ function cycleOption(slotDef, dir) {
   rebuildPreview();
 }
 function cycleColor(key, dir) {
-  builder.spec.colors[key] = ((builder.spec.colors[key] || 0) + dir + PAL.length) % PAL.length;
+  const list = paletteFor(key);
+  // a character saved before this slot was restricted can hold a color the
+  // slot no longer offers: step into the allowed list from the near end
+  let i = list.indexOf(builder.spec.colors[key] || 0);
+  if (i < 0) i = dir > 0 ? -1 : 0;
+  builder.spec.colors[key] = list[(i + dir + list.length) % list.length];
   builder.dirty = true;
   rebuildPreview();
 }
 function setColor(key, ci) {
+  if (!colorAllowed(key, ci)) return;
   builder.spec.colors[key] = clamp(ci, 0, PAL.length - 1);
   builder.dirty = true;
   rebuildPreview();
@@ -4250,7 +4275,8 @@ function openColorPick(key) { colorPick.active = true; colorPick.key = key; }
 function renderColorPick(ctx) {
   if (!colorPick.active) return;
   const COLS = 8, CW = 17, CH = 13;
-  const w = COLS * CW + 8, h = Math.ceil(PAL.length / COLS) * CH + 22;
+  const list = paletteFor(colorPick.key);
+  const w = COLS * CW + 8, h = Math.ceil(list.length / COLS) * CH + 22;
   const x0 = (IW - w) >> 1, y0 = (IH - h) >> 1;
   // registered first, so every swatch below sits on top of it: a click that
   // misses the grid closes the picker
@@ -4258,8 +4284,9 @@ function renderColorPick(ctx) {
   panel(ctx, x0, y0, w, h, NIGHT, ICE);
   drawTextC(ctx, "PICK A COLOR", IW / 2, y0 + 3, WHITE);
   const cur = builder.spec.colors[colorPick.key];
-  for (let i = 0; i < PAL.length; i++) {
-    const sx = x0 + 4 + (i % COLS) * CW, sy = y0 + 13 + Math.floor(i / COLS) * CH;
+  for (let n = 0; n < list.length; n++) {
+    const i = list[n];
+    const sx = x0 + 4 + (n % COLS) * CW, sy = y0 + 13 + Math.floor(n / COLS) * CH;
     rect(ctx, sx, sy, CW - 2, CH - 2, i);
     // SLATE, not NIGHT: the dark end of the palette would vanish into the panel
     frameRect(ctx, sx, sy, CW - 2, CH - 2, i === cur ? WHITE : SLATE);
@@ -4357,7 +4384,8 @@ function renderBuilder(ctx, dt) {
     uiBtn(bx, 160, w, 13, cb);
     bx += w + 5;
   }
-  drawText(ctx, canStore ? "AUTO-SAVE ON - SWATCH = ALL 32 COLORS"
+  // (the shirt and legs offer 27 of the 32: no skin tones)
+  drawText(ctx, canStore ? "AUTO-SAVE ON - SWATCH PICKS A COLOR"
                          : "NO BROWSER STORAGE - USE EXPORT", 110, 150, SILVER);
   renderColorPick(ctx);
 }
