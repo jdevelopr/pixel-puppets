@@ -970,72 +970,106 @@ function paintCastle(c) {
     const off = (y / 12) % 2 ? 12 : 0;
     for (let x = off; x < IW; x += 24) rect(c, x, y, 1, 12, DUSK);
   }
-  // random darker stones
+  // random darker stones, with a few weathered warm ones among them
   for (let i = 0; i < 40; i++) {
     const gx = Math.floor(r() * 13), gy = Math.floor(r() * 8);
-    rect(c, gx * 24 + ((gy % 2) ? 12 : 0) + 1, gy * 12 + 1, 23, 11, r() < 0.5 ? SLATE : DUSK);
+    const t = r();
+    rect(c, gx * 24 + ((gy % 2) ? 12 : 0) + 1, gy * 12 + 1, 23, 11,
+         t < 0.45 ? SLATE : t < 0.85 ? DUSK : OLIVE);
+  }
+  // damp moss creeping up from the floor line
+  for (let i = 0; i < 90; i++) {
+    const mx = Math.floor(r() * IW), my = 96 - Math.floor(r() * r() * 22);
+    px(c, mx, my, r() < 0.65 ? MOSS : OLIVE);
   }
   // columns
   for (const x of [24, 152, 280]) {
     rect(c, x, 0, 16, 100, SILVER);
     rect(c, x, 0, 2, 100, WHITE); rect(c, x + 14, 0, 2, 100, SLATE);
     rect(c, x - 2, 96, 20, 6, SILVER); rect(c, x - 2, 96, 20, 1, WHITE);
+    for (let i = 0; i < 5; i++) px(c, x + 2 + Math.floor(r() * 12), 88 + Math.floor(r() * 8), MOSS);
   }
-  // banners
+  // banners: wine shadow fold, gold trim and emblem
   for (const x of [72, 200]) {
     rect(c, x, 8, 24, 34, RED);
-    rect(c, x, 8, 24, 3, ORANGE);
-    rect(c, x + 2, 36, 4, 8, RED); rect(c, x + 10, 38, 4, 8, RED); rect(c, x + 18, 36, 4, 8, RED);
-    rect(c, x + 8, 18, 8, 8, SAND); rect(c, x + 10, 14, 4, 4, SAND);
+    rect(c, x + 17, 8, 7, 34, WINE);
+    rect(c, x, 8, 24, 3, GOLD);
+    rect(c, x + 2, 36, 4, 8, RED); rect(c, x + 10, 38, 4, 8, RED); rect(c, x + 18, 36, 4, 8, WINE);
+    rect(c, x + 8, 18, 8, 8, GOLD); rect(c, x + 10, 14, 4, 4, GOLD);
+    px(c, x + 9, 19, CREAM); px(c, x + 11, 15, CREAM);
   }
-  // torches
+  // torches in iron-and-wood brackets
   for (const x of [126, 254]) {
-    rect(c, x, 40, 4, 12, DUSK);
-    rect(c, x, 34, 4, 6, ORANGE); rect(c, x + 1, 30, 2, 4, SAND);
+    rect(c, x, 40, 4, 12, BROWN);
+    px(c, x, 40, COCOA); px(c, x + 3, 51, COCOA);
+    rect(c, x, 34, 4, 6, RUST);
+    rect(c, x, 34, 4, 3, ORANGE);
+    rect(c, x + 1, 30, 2, 4, GOLD);
+    px(c, x + 1, 29, CREAM);
   }
-  // window
+  // window with warm light behind it
   rect(c, 300, 10, 14, 30, NIGHT); rect(c, 302, 12, 10, 26, NAVY);
   px(c, 305, 16, WHITE); px(c, 309, 24, WHITE);
+  rect(c, 302, 32, 10, 6, VIOLET);
   // floor: checkered flagstones
   rect(c, 0, 96, IW, IH - 96, DUSK);
   for (let y = 96; y < IH; y += 12)
     for (let x = 0; x < IW; x += 12)
       if (((x + y) / 12) % 2 < 1) rect(c, x, y, 12, 12, SLATE);
   rect(c, 0, 96, IW, 2, NIGHT);
+  for (let i = 0; i < 40; i++) px(c, Math.floor(r() * IW), 98 + Math.floor(r() * 6), MOSS);
 }
 
 function paintForest(c) {
   const r = RNG(21);
   rect(c, 0, 0, IW, 96, SKY);
   // sun
-  rect(c, 262, 12, 18, 18, SAND); rect(c, 266, 8, 10, 26, SAND); rect(c, 258, 16, 26, 10, SAND);
+  rect(c, 262, 12, 18, 18, GOLD); rect(c, 266, 8, 10, 26, GOLD); rect(c, 258, 16, 26, 10, GOLD);
+  rect(c, 266, 16, 10, 10, CREAM);
   // clouds
   for (const [x, y, w] of [[30, 18, 40], [130, 30, 30], [210, 12, 36]]) {
     rect(c, x, y, w, 8, WHITE); rect(c, x + 6, y - 4, w - 12, 4, WHITE);
+    rect(c, x + 2, y + 6, w - 4, 2, LILAC);
   }
-  // far hills
-  rect(c, 0, 70, IW, 26, GREEN);
-  for (let x = 0; x < IW; x += 8) rect(c, x, 66 + ((x / 8) % 3 === 0 ? 0 : 2), 8, 6, GREEN);
-  // trees
+  // far hills, two depths
+  rect(c, 0, 70, IW, 26, MOSS);
+  for (let x = 0; x < IW; x += 8) rect(c, x, 66 + ((x / 8) % 3 === 0 ? 0 : 2), 8, 6, MOSS);
+  rect(c, 0, 78, IW, 18, GREEN);
+  for (let x = 0; x < IW; x += 10) rect(c, x, 76 + ((x / 10) % 2) * 2, 10, 4, GREEN);
+  // trees: real bark, and canopies with a shaded underside
   for (const x of [18, 92, 196, 286]) {
-    rect(c, x + 6, 48, 8, 52, DUSK);
-    rect(c, x + 7, 48, 2, 52, SLATE);
+    rect(c, x + 6, 48, 8, 52, BROWN);
+    rect(c, x + 6, 48, 2, 52, TAN);
+    rect(c, x + 12, 48, 2, 52, COCOA);
+    for (let i = 0; i < 6; i++) px(c, x + 8 + Math.floor(r() * 4), 52 + Math.floor(r() * 44), COCOA);
     rect(c, x - 8, 22, 36, 30, GREEN);
     rect(c, x - 2, 12, 24, 14, GREEN);
-    for (let i = 0; i < 10; i++) px(c, x - 6 + Math.floor(r() * 32), 16 + Math.floor(r() * 32), LIME);
+    rect(c, x - 8, 44, 36, 8, MOSS);            // shaded underside
+    rect(c, x - 2, 12, 24, 5, LIME);            // sunlit crown
+    for (let i = 0; i < 14; i++) px(c, x - 6 + Math.floor(r() * 32), 16 + Math.floor(r() * 32), LIME);
+    for (let i = 0; i < 10; i++) px(c, x - 6 + Math.floor(r() * 32), 24 + Math.floor(r() * 26), OLIVE);
   }
   // grass floor
   rect(c, 0, 96, IW, IH - 96, GREEN);
   rect(c, 0, 96, IW, 2, LIME);
   for (let i = 0; i < 160; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), LIME);
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 110; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), MOSS);
+  for (let i = 0; i < 70; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), OLIVE);
+  // wildflowers, now in more than two colors
+  const PETALS = [ROSE, GOLD, MAGENTA, CREAM, LILAC, WHITE];
+  for (let i = 0; i < 34; i++) {
     const fx = Math.floor(r() * IW), fy = 104 + Math.floor(r() * 68);
-    px(c, fx, fy, r() < 0.5 ? RED : SAND); px(c, fx, fy + 1, DUSK);
+    px(c, fx, fy, PETALS[Math.floor(r() * PETALS.length)]);
+    px(c, fx, fy + 1, MOSS);
   }
-  // path
+  // dirt path
   for (let y = 96; y < IH; y += 4) {
     const w = 30 + (y - 96);
-    rect(c, 160 - (w >> 1), y, w, 4, SAND);
+    rect(c, 160 - (w >> 1), y, w, 4, TAN);
+  }
+  for (let i = 0; i < 50; i++) {
+    const py = 96 + Math.floor(r() * 80), pw = 30 + (py - 96);
+    px(c, 160 - (pw >> 1) + Math.floor(r() * pw), py, r() < 0.5 ? SAND : BROWN);
   }
 }
 
@@ -1046,19 +1080,26 @@ function paintSpaceship(c) {
   for (let y = 0; y < 96; y += 24) rect(c, 0, y, IW, 1, NIGHT);
   for (let x = 0; x < IW; x += 40) rect(c, x, 0, 1, 96, NIGHT);
   for (let i = 0; i < 14; i++) px(c, 4 + Math.floor(r() * 300), 4 + Math.floor(r() * 88), SLATE);
-  // big viewport with stars
+  // big viewport: nebula behind the starfield
   panel(c, 90, 8, 140, 56, NIGHT, SILVER);
   frameRect(c, 91, 9, 138, 54, SLATE);
+  for (let i = 0; i < 26; i++) {
+    const nx = 96 + Math.floor(r() * 124), ny = 14 + Math.floor(r() * 42);
+    rect(c, nx, ny, 4 + Math.floor(r() * 8), 2, r() < 0.6 ? VIOLET : WINE);
+  }
+  for (let i = 0; i < 14; i++) px(c, 96 + Math.floor(r() * 124), 14 + Math.floor(r() * 42), MAGENTA);
   for (let i = 0; i < 40; i++) px(c, 94 + Math.floor(r() * 132), 12 + Math.floor(r() * 48), r() < 0.8 ? WHITE : ICE);
-  rect(c, 196, 40, 10, 10, RED); rect(c, 198, 42, 6, 6, ORANGE);   // a planet
+  rect(c, 196, 40, 10, 10, RUST); rect(c, 198, 42, 6, 6, ORANGE);   // a planet
+  rect(c, 193, 44, 16, 1, GOLD);                                    // its ring
   // consoles
   for (const x of [8, 244]) {
     panel(c, x, 56, 68, 40, SLATE, NIGHT);
     for (let i = 0; i < 12; i++) {
       const cx2 = x + 6 + (i % 4) * 16, cy = 62 + Math.floor(i / 4) * 10;
-      rect(c, cx2, cy, 8, 4, [RED, LIME, SKY, SAND][Math.floor(r() * 4)]);
+      rect(c, cx2, cy, 8, 4, [RED, LIME, SKY, GOLD, MAGENTA, AQUA][Math.floor(r() * 6)]);
     }
     rect(c, x + 4, 88, 60, 4, TEAL);
+    rect(c, x + 4, 88, 60, 1, AQUA);
   }
   // floor: grated deck
   rect(c, 0, 96, IW, IH - 96, SLATE);
@@ -1066,38 +1107,48 @@ function paintSpaceship(c) {
   for (let y = 100; y < IH; y += 8) rect(c, 0, y, IW, 1, DUSK);
   for (let x = 0; x < IW; x += 16) rect(c, x, 98, 1, IH - 98, DUSK);
   // glowing floor strip
-  rect(c, 0, 96, IW, 1, ICE);
+  rect(c, 0, 96, IW, 1, AQUA);
 }
 
 function paintSchool(c) {
   const r = RNG(5);
-  rect(c, 0, 0, IW, 96, SAND);
-  rect(c, 0, 90, IW, 6, ORANGE);
-  // chalkboard
-  panel(c, 60, 10, 130, 52, TEAL, DUSK);
-  frameRect(c, 61, 11, 128, 50, SAND);
+  rect(c, 0, 0, IW, 96, CREAM);
+  rect(c, 0, 74, IW, 22, SAND);          // wainscot
+  rect(c, 0, 74, IW, 1, TAN);
+  rect(c, 0, 90, IW, 6, TAN);
+  rect(c, 0, 95, IW, 1, BROWN);
+  // chalkboard in a wooden frame
+  panel(c, 60, 10, 130, 52, TEAL, BROWN);
+  frameRect(c, 61, 11, 128, 50, TAN);
   drawText(c, "PIXEL PUPPETS", 70, 18, WHITE);
   drawText(c, "2 + 2 = 4", 70, 30, WHITE);
   drawText(c, "abc def g", 70, 42, ICE);
+  rect(c, 168, 56, 12, 3, CREAM);        // chalk tray + chalk
+  rect(c, 62, 56, 128, 3, BROWN);
   // clock
-  rect(c, 240, 14, 18, 18, WHITE); frameRect(c, 240, 14, 18, 18, NIGHT);
+  rect(c, 240, 14, 18, 18, WHITE); frameRect(c, 240, 14, 18, 18, BROWN);
   rect(c, 248, 18, 2, 6, NIGHT); rect(c, 250, 22, 4, 2, NIGHT);
   // door
-  rect(c, 8, 30, 34, 66, DUSK); rect(c, 10, 32, 30, 62, ORANGE); px(c, 36, 62, SAND);
+  rect(c, 8, 30, 34, 66, COCOA); rect(c, 10, 32, 30, 62, BROWN);
+  rect(c, 13, 35, 24, 24, TAN); rect(c, 13, 63, 24, 26, TAN);
+  px(c, 36, 62, GOLD); px(c, 36, 63, GOLD);
   // alphabet strip
-  rect(c, 50, 70, 252, 12, WHITE); frameRect(c, 50, 70, 252, 12, SLATE);
+  rect(c, 50, 70, 252, 12, WHITE); frameRect(c, 50, 70, 252, 12, TAN);
   drawText(c, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 56, 72, NAVY);
   // wood floor
-  rect(c, 0, 96, IW, IH - 96, ORANGE);
-  rect(c, 0, 96, IW, 2, DUSK);
-  for (let y = 96; y < IH; y += 10) rect(c, 0, y, IW, 1, DUSK);
-  for (let i = 0; i < 30; i++) rect(c, Math.floor(r() * IW), 96 + Math.floor(r() * 80), 8, 1, SAND);
+  rect(c, 0, 96, IW, IH - 96, TAN);
+  rect(c, 0, 96, IW, 2, BROWN);
+  for (let y = 96; y < IH; y += 10) rect(c, 0, y, IW, 1, BROWN);
+  for (let i = 0; i < 20; i++) rect(c, Math.floor(r() * IW), 96 + Math.floor(r() * 80), 7, 1, SAND);
+  for (let i = 0; i < 14; i++) rect(c, Math.floor(r() * IW), 96 + Math.floor(r() * 80), 5, 1, COCOA);
   // desks near the back of the floor band
   for (const x of [40, 230]) {
-    rect(c, x, 86, 50, 3, SAND);
-    rect(c, x, 89, 50, 3, DUSK);
-    rect(c, x + 2, 92, 3, 16, DUSK); rect(c, x + 45, 92, 3, 16, DUSK);
-    rect(c, x + 2, 106, 46, 2, DUSK);
+    rect(c, x, 85, 50, 1, NIGHT);
+    rect(c, x, 86, 50, 3, CREAM);
+    rect(c, x, 89, 50, 3, BROWN);
+    rect(c, x, 92, 50, 1, COCOA);
+    rect(c, x + 2, 92, 3, 16, COCOA); rect(c, x + 45, 92, 3, 16, COCOA);
+    rect(c, x + 2, 106, 46, 2, COCOA);
   }
 }
 
@@ -1105,46 +1156,70 @@ function paintBeach(c) {
   const r = RNG(33);
   rect(c, 0, 0, IW, 62, SKY);
   // sun with rays
-  rect(c, 24, 10, 16, 16, SAND); rect(c, 28, 6, 8, 24, SAND); rect(c, 20, 14, 24, 8, SAND);
+  rect(c, 24, 10, 16, 16, GOLD); rect(c, 28, 6, 8, 24, GOLD); rect(c, 20, 14, 24, 8, GOLD);
+  rect(c, 28, 14, 8, 8, CREAM);
   for (const [x, y, w] of [[110, 14, 34], [220, 26, 40], [60, 34, 26]]) {
     rect(c, x, y, w, 7, WHITE); rect(c, x + 5, y - 3, w - 10, 3, WHITE);
+    rect(c, x + 2, y + 5, w - 4, 2, LILAC);
   }
-  // ocean
-  rect(c, 0, 62, IW, 34, BLUE);
+  // ocean: deep water, mid water, then a shallow band at the shore
+  rect(c, 0, 62, IW, 34, TEAL);
+  rect(c, 0, 72, IW, 24, BLUE);
+  rect(c, 0, 88, IW, 8, AQUA);
+  rect(c, 0, 94, IW, 2, MINT);
   for (let y = 66; y < 96; y += 6)
-    for (let x = (y % 12) ? 6 : 0; x < IW; x += 24) rect(c, x, y, 10, 1, ICE);
+    for (let x = (y % 12) ? 6 : 0; x < IW; x += 24) rect(c, x, y, 10, 1, y > 84 ? MINT : ICE);
   // sailboat
-  rect(c, 236, 58, 22, 4, DUSK);
-  rect(c, 246, 38, 2, 20, DUSK);
-  for (let i = 0; i < 14; i++) rect(c, 248, 38 + i, Math.min(i, 12), 1, WHITE);
+  rect(c, 236, 58, 22, 4, BROWN);
+  rect(c, 246, 38, 2, 20, TAN);
+  for (let i = 0; i < 14; i++) rect(c, 248, 38 + i, Math.min(i, 12), 1, i > 8 ? CREAM : WHITE);
   // sand
   rect(c, 0, 96, IW, IH - 96, SAND);
-  rect(c, 0, 96, IW, 2, WHITE);
-  for (let i = 0; i < 140; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), ORANGE);
+  rect(c, 0, 96, IW, 2, CREAM);
+  for (let i = 0; i < 140; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), TAN);
+  for (let i = 0; i < 40; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), PEACH);
   for (let i = 0; i < 16; i++) px(c, Math.floor(r() * IW), 104 + Math.floor(r() * 70), WHITE);
+  // shells
+  for (let i = 0; i < 7; i++) {
+    const sx = Math.floor(r() * IW), sy = 108 + Math.floor(r() * 60);
+    px(c, sx, sy, ROSE); px(c, sx + 1, sy, CREAM);
+  }
   // palm tree
-  for (let i = 0; i < 26; i++) rect(c, 284 + (i >> 3), 96 - i, 5, 1, ORANGE);
-  rect(c, 285, 92, 3, 4, DUSK);
-  for (const [dx, dy, w] of [[-16, -4, 18], [2, -4, 18], [-12, -8, 14], [0, -8, 14], [-6, -12, 12]])
+  for (let i = 0; i < 26; i++) {
+    rect(c, 284 + (i >> 3), 96 - i, 5, 1, BROWN);
+    px(c, 284 + (i >> 3), 96 - i, TAN);
+    if (i % 4 === 0) px(c, 287 + (i >> 3), 96 - i, COCOA);
+  }
+  rect(c, 285, 92, 3, 4, COCOA);
+  for (const [dx, dy, w] of [[-16, -4, 18], [2, -4, 18], [-12, -8, 14], [0, -8, 14], [-6, -12, 12]]) {
     rect(c, 287 + dx, 70 + dy, w, 3, GREEN);
-  rect(c, 283, 74, 3, 3, RED);   // coconut
+    rect(c, 287 + dx, 70 + dy + 2, w, 1, MOSS);
+    px(c, 287 + dx + (dx < 0 ? 0 : w - 1), 70 + dy, LIME);
+  }
+  rect(c, 283, 74, 3, 3, BROWN);   // coconut
+  px(c, 283, 74, TAN);
   // beach ball on the sand
-  rect(c, 40, 108, 8, 8, WHITE); rect(c, 40, 108, 4, 4, RED); rect(c, 44, 112, 4, 4, RED);
+  rect(c, 40, 108, 8, 8, WHITE); rect(c, 40, 108, 4, 4, ROSE); rect(c, 44, 112, 4, 4, AQUA);
   frameRect(c, 40, 108, 8, 8, DUSK);
 }
 
 function paintCity(c) {
   const r = RNG(64);
   rect(c, 0, 0, IW, 96, NAVY);
+  rect(c, 0, 44, IW, 52, VIOLET);          // city glow on the horizon
+  rect(c, 0, 44, IW, 6, NAVY);
+  for (let y = 50; y < 96; y += 6) rect(c, 0, y, IW, 2, NAVY);
   rect(c, 262, 10, 14, 14, WHITE); rect(c, 266, 14, 4, 4, SILVER);   // moon
-  for (let i = 0; i < 26; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 50), WHITE);
+  for (let i = 0; i < 26; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 44), WHITE);
   // far skyline
+  const LIT = [GOLD, GOLD, CREAM, SAND, AQUA, MAGENTA];
   for (let x = 0, i = 0; x < IW; i++) {
     const w = 26 + Math.floor(r() * 22), h = 30 + Math.floor(r() * 26);
     rect(c, x, 96 - h, w, h, SLATE);
+    rect(c, x, 96 - h, w, 1, LILAC);
     for (let wy = 96 - h + 4; wy < 90; wy += 7)
       for (let wx = x + 3; wx < x + w - 4; wx += 7)
-        if (r() < 0.4) rect(c, wx, wy, 3, 4, SAND);
+        if (r() < 0.4) rect(c, wx, wy, 3, 4, LIT[Math.floor(r() * LIT.length)]);
     x += w + 4;
   }
   // near buildings, left and right
@@ -1153,18 +1228,26 @@ function paintCity(c) {
     rect(c, x, 96 - h, w, 2, NIGHT);
     for (let wy = 96 - h + 6; wy < 90; wy += 9)
       for (let wx = x + 4; wx < x + w - 5; wx += 9)
-        rect(c, wx, wy, 4, 5, r() < 0.55 ? SAND : NIGHT);
+        rect(c, wx, wy, 4, 5, r() < 0.55 ? (r() < 0.8 ? GOLD : AQUA) : NIGHT);
   }
+  // neon sign up the right-hand building
+  rect(c, 286, 34, 3, 26, MAGENTA);
+  rect(c, 292, 34, 3, 26, AQUA);
+  rect(c, 286, 30, 9, 3, MAGENTA);
+  px(c, 285, 40, ROSE); px(c, 296, 48, MINT);
   // street
   rect(c, 0, 96, IW, IH - 96, DUSK);
   rect(c, 0, 96, IW, 8, SILVER);              // sidewalk
   rect(c, 0, 103, IW, 1, NIGHT);
   for (let x = 0; x < IW; x += 20) rect(c, x, 96, 1, 7, SLATE);
-  for (let x = 4; x < IW; x += 28) rect(c, x, 140, 14, 3, SAND);   // lane dashes
+  for (let x = 4; x < IW; x += 28) rect(c, x, 140, 14, 3, GOLD);   // lane dashes
+  // pools of lamplight on the wet street
+  for (const x of [70, 240]) rect(c, x - 14, 104, 32, 3, SLATE);
   // street lamps
   for (const x of [70, 240]) {
     rect(c, x, 52, 3, 44, SLATE);
-    rect(c, x - 3, 48, 9, 5, SAND);
+    rect(c, x - 3, 48, 9, 5, GOLD);
+    rect(c, x - 2, 53, 7, 2, GOLD);
     rect(c, x - 1, 46, 5, 2, SLATE);
   }
 }
@@ -1173,43 +1256,54 @@ function paintTheater(c) {
   // back wall with a dark arch, for depth
   rect(c, 0, 0, IW, IH, PLUM);
   for (let y = 8; y < 90; y += 12)
-    for (let x = 8 + ((y / 12) % 2) * 8; x < IW; x += 16) px(c, x, y, DUSK);
+    for (let x = 8 + ((y / 12) % 2) * 8; x < IW; x += 16) px(c, x, y, VIOLET);
   rect(c, 96, 20, 128, 76, NIGHT);
   rect(c, 100, 24, 120, 72, DUSK);
   // painted stars and a moon on the backcloth
   for (const [sx, sy] of [[112, 32], [140, 44], [170, 30], [196, 50], [206, 34], [126, 60], [184, 66]]) {
-    px(c, sx, sy, SAND); px(c, sx - 1, sy, DUSK); px(c, sx + 1, sy, SAND); px(c, sx, sy - 1, SAND); px(c, sx, sy + 1, SAND);
+    px(c, sx, sy, GOLD); px(c, sx - 1, sy, DUSK); px(c, sx + 1, sy, GOLD); px(c, sx, sy - 1, GOLD); px(c, sx, sy + 1, GOLD);
   }
-  rect(c, 150, 70, 10, 10, SAND); rect(c, 148, 68, 8, 8, DUSK);
-  // stage floor
-  rect(c, 0, 96, IW, IH - 96, ORANGE);
-  rect(c, 0, 96, IW, 2, SAND);
-  for (let y = 104; y < IH; y += 12) rect(c, 0, y, IW, 1, DUSK);
-  for (let x = 0; x < IW; x += 40) rect(c, x, 98, 1, IH - 98, DUSK);
+  rect(c, 150, 70, 10, 10, CREAM); rect(c, 148, 68, 8, 8, DUSK);
+  // stage floor: warm boards
+  rect(c, 0, 96, IW, IH - 96, TAN);
+  rect(c, 0, 96, IW, 2, GOLD);
+  for (let y = 104; y < IH; y += 12) rect(c, 0, y, IW, 1, BROWN);
+  for (let x = 0; x < IW; x += 40) rect(c, x, 98, 1, IH - 98, BROWN);
   // footlights
-  for (let x = 8; x < IW; x += 24) { rect(c, x, IH - 5, 8, 3, SAND); rect(c, x, IH - 2, 8, 2, DUSK); }
+  for (let x = 8; x < IW; x += 24) { rect(c, x, IH - 5, 8, 3, GOLD); rect(c, x, IH - 2, 8, 2, BROWN); }
   // side curtains with fold stripes
   for (const [x0, dir] of [[0, 1], [IW - 44, -1]]) {
     rect(c, x0, 0, 44, 150, RED);
-    for (let i = 6; i < 44; i += 8) rect(c, x0 + (dir > 0 ? i : 44 - i - 3), 0, 3, 146, PLUM);
+    for (let i = 6; i < 44; i += 8) rect(c, x0 + (dir > 0 ? i : 44 - i - 3), 0, 3, 146, WINE);
     rect(c, x0, 146, 44, 8, RED);
-    rect(c, x0, 150, 44, 2, PLUM);
-    rect(c, x0 + (dir > 0 ? 30 : 2), 60, 12, 8, SAND);   // tieback
+    rect(c, x0, 150, 44, 2, WINE);
+    rect(c, x0 + (dir > 0 ? 30 : 2), 60, 12, 8, GOLD);   // tieback
+    px(c, x0 + (dir > 0 ? 30 : 2), 60, CREAM);
   }
   // valance across the top
   rect(c, 0, 0, IW, 12, RED);
   for (let x = 0; x < IW; x += 16) rect(c, x + 4, 12, 8, 4, RED);
-  for (let x = 0; x < IW; x += 16) rect(c, x + 6, 16, 4, 2, SAND);
-  rect(c, 0, 0, IW, 2, SAND);
+  for (let x = 0; x < IW; x += 16) rect(c, x + 6, 16, 4, 2, GOLD);
+  rect(c, 0, 0, IW, 2, GOLD);
+  rect(c, 0, 10, IW, 2, WINE);
 }
 
 function paintGraveyard(c) {
   const r = RNG(13);
   rect(c, 0, 0, IW, 96, NIGHT);
-  for (let i = 0; i < 20; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 60), SILVER);
-  // moon with craters
-  rect(c, 48, 12, 22, 22, WHITE);
+  // A faint haze rising off the ground - dithered only, never a solid fill,
+  // so the sky stays properly black and nothing reads as a band.
+  for (let y = 70; y < 96; y++) {
+    const dens = ((y - 70) / 26) * 0.55;
+    for (let x = (y % 2) * 2; x < IW; x += 4)
+      if (r() < dens) px(c, x, y, r() < 0.75 ? PLUM : VIOLET);
+  }
+  for (let i = 0; i < 20; i++) px(c, Math.floor(r() * IW), Math.floor(r() * 56), SILVER);
+  // moon with craters, and a faint halo in the glow
+  rect(c, 46, 10, 26, 26, PLUM);
+  rect(c, 48, 12, 22, 22, CREAM);
   rect(c, 54, 18, 4, 4, SILVER); rect(c, 62, 26, 3, 3, SILVER);
+  rect(c, 50, 28, 6, 3, SILVER);
   // drifting cloud streaks (ragged, two offset layers each)
   for (const [cx2, cy2, w] of [[90, 20, 60], [200, 34, 70], [30, 44, 50]]) {
     rect(c, cx2, cy2, w, 2, DUSK);
@@ -1218,28 +1312,34 @@ function paintGraveyard(c) {
   }
   // bats
   for (const [x, y] of [[140, 24], [170, 16], [210, 30]]) {
-    rect(c, x, y, 3, 1, PLUM); rect(c, x - 3, y - 1, 3, 1, PLUM); rect(c, x + 3, y - 1, 3, 1, PLUM);
+    rect(c, x, y, 3, 1, VIOLET); rect(c, x - 3, y - 1, 3, 1, VIOLET); rect(c, x + 3, y - 1, 3, 1, VIOLET);
   }
   // hills
   rect(c, 0, 80, IW, 16, DUSK);
   for (let x = 0; x < IW; x += 10) rect(c, x, 76 + ((x / 10) % 2) * 2, 10, 6, DUSK);
   // dead tree
-  rect(c, 250, 40, 5, 56, DUSK);
-  rect(c, 236, 46, 16, 3, DUSK); rect(c, 236, 38, 3, 10, DUSK);
-  rect(c, 255, 52, 20, 3, DUSK); rect(c, 272, 42, 3, 12, DUSK);
+  rect(c, 250, 40, 5, 56, COCOA);
+  rect(c, 236, 46, 16, 3, COCOA); rect(c, 236, 38, 3, 10, COCOA);
+  rect(c, 255, 52, 20, 3, COCOA); rect(c, 272, 42, 3, 12, COCOA);
+  rect(c, 250, 40, 2, 56, BROWN);
   // iron fence along the horizon
   rect(c, 0, 90, IW, 1, SLATE);
   for (let x = 4; x < IW; x += 8) rect(c, x, 84, 2, 12, SLATE);
-  // gravestones just past the fence
+  for (let x = 4; x < IW; x += 24) px(c, x, 86, RUST);          // spots of rust
+  // gravestones just past the fence, mossy at the base
   for (const x of [24, 96, 150, 208, 288]) {
     rect(c, x, 84, 12, 12, SILVER);
     rect(c, x + 2, 82, 8, 2, SILVER);
     rect(c, x + 3, 88, 6, 1, SLATE); rect(c, x + 4, 91, 4, 1, SLATE);
+    rect(c, x, 94, 12, 2, MOSS);
+    px(c, x + 1, 92, MOSS); px(c, x + 10, 93, OLIVE);
   }
   // ground
   rect(c, 0, 96, IW, IH - 96, DUSK);
   rect(c, 0, 96, IW, 1, PLUM);
   for (let i = 0; i < 90; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), PLUM);
+  for (let i = 0; i < 26; i++) px(c, Math.floor(r() * IW), 100 + Math.floor(r() * 76), VIOLET);
+  for (let i = 0; i < 26; i++) px(c, Math.floor(r() * IW), 130 + Math.floor(r() * 46), MOSS);
   for (let i = 0; i < 24; i++) {
     const gx = Math.floor(r() * IW), gy = 102 + Math.floor(r() * 72);
     rect(c, gx, gy, 1, 2, LIME);   // eerie grass tufts
@@ -1800,73 +1900,73 @@ const PROP_DEFS = [
     // a seat-only "vehicle": puppets sit via USE, but it never moves
     vehicle: { seatDx: 1, seatDy: 2, accX: 0, topX: 0, accY: 0, topY: 0, seatOnly: true, exitDx: 14 },
     frames: [[
-    ".3333",
-    ".3..3",
-    ".3333",
-    ".3..3",
-    ".3333",
-    ".3..3",
-    ".3333",
-    ".33",
-    ".33",
-    ".33",
-    ".33",
-    ".33",
-    ".33",
-    ".33",
-    "0333333333333330",
-    "0222222222222230",
-    "0333333333333330",
-    "..33.........33.",
-    "..33.........33.",
-    "..33.........33.",
-    "..33.........33.",
-    "..33.........33.",
-    "..33.........33.",
-    ".033.........330"]] },
+    ".hhhh",
+    ".h..h",
+    ".hhhh",
+    ".h..h",
+    ".hhhh",
+    ".h..h",
+    ".hhhh",
+    ".ij",
+    ".ij",
+    ".ij",
+    ".ij",
+    ".ij",
+    ".ij",
+    ".ij",
+    "0hhhhhhhhhhhhhh0",
+    "0oooooooooooooo0",
+    "0iiiiiiiiiiiiii0",
+    "..ij.........ij.",
+    "..ij.........ij.",
+    "..ij.........ij.",
+    "..ij.........ij.",
+    "..ij.........ij.",
+    "..ij.........ij.",
+    ".0ij.........ij0"]] },
   { id: "crate", name: "CRATE", ox: -7, oy: -13, fms: 999, hp: 2, frames: [[
     "00000000000000",
-    "03333333333330",
-    "03033333333030",
-    "03303333330330",
-    "03330330303330",
-    "03333033033330",
-    "03330330303330",
-    "03303333330330",
-    "03033333333030",
-    "03333333333330",
+    "0hhhhhhhhhhhh0",
+    "0ihhhhhhhhhhi0",
+    "0hihhhhhhhhih0",
+    "0hhihhihihhih0",
+    "0hhhhihhihhhh0",
+    "0hhihhihihhih0",
+    "0hihhhhhhhhih0",
+    "0ihhhhhhhhhhi0",
+    "0iiiiiiiiiiii0",
     "00000000000000"]] },
   { id: "fire", name: "CAMPFIRE", ox: -7, oy: -12, fms: 180, frames: [[
-    "......33",
-    ".....343.3",
-    "....33433.",
-    "....34443.",
-    "...3344433",
-    "...3444433",
-    "....34443.",
+    "......p3",
+    ".....3q3.p",
+    "....p3q43.",
+    "....34qq3.",
+    "...pq4qq43",
+    "...3q4qq4p",
+    "....3q443.",
     ".0000000000.",
-    "033333333330",
+    "0jiiiiiiij0",
     ".0000000000."], [
-    "....3..3",
-    "...33.343",
-    "....33433.",
-    "...334443.",
-    "...3444433",
-    "....444433",
-    "....34443.",
+    "....p..3",
+    "...p3.3q3",
+    "....33q43.",
+    "...p34qq3.",
+    "...3q4qq43",
+    "....q4qq4p",
+    "....3q443.",
     ".0000000000.",
-    "033333333330",
+    "0jiiiiiiij0",
     ".0000000000."]] },
   { id: "bush", name: "BUSH", ox: -9, oy: -13, fms: 999, frames: [[
-    ".....66666",
-    "...6666666666",
-    "..666656666666",
+    ".....56655",
+    "...5666656665",
+    "..666656666566",
     ".6666666665666",
-    "666566666666666",
-    "666666656666666",
-    ".6666666666666",
-    "...666..666",
-    "....f....f"]] },
+    "666566666666s66",
+    "6s6666656666666",
+    ".6tt666666tt66",
+    "...ttt..ttt",
+    "....i....i"]] },
   { id: "ball", name: "BALL", ox: -5, oy: -9, fms: 999, frames: [[
     "..cc22..",
     ".ccc222.",
@@ -1877,20 +1977,20 @@ const PROP_DEFS = [
     "..c222.."]] },
   { id: "chest", name: "CHEST", ox: -8, oy: -11, fms: 999, frames: [[
     ".00000000000000.",
-    "0333333333333330",
-    "0333333443333330",
-    "0000000440000000",
-    "0333333443333330",
-    "0333333333333330",
-    "0333333333333330",
+    "0hhhhhhhhhhhhhh0",
+    "0ihhhhhqqhhhhhi0",
+    "0iiiiiiqqiiiiii0",
+    "0hhhhhhqqhhhhhh0",
+    "0hhhhhhhhhhhhhh0",
+    "0ihhhhhhhhhhhhi0",
     ".00000000000000."]] },
   { id: "rock", name: "ROCK", ox: -7, oy: -9, fms: 999, frames: [[
     "....ddddd",
-    "..ddddddddd",
-    ".ddddeddddd",
-    "dddddddedddd",
+    "..dddddddtd",
+    ".ddddedddttd",
+    "dddddddeddtd",
     "dedddddddddd",
-    "eeeeeeeeeeee"]] }
+    "eeeeetteeeee"]] }
 ];
 function propDef(id) { for (const d of PROP_DEFS) if (d.id === id) return d; return PROP_DEFS[0]; }
 
@@ -3685,7 +3785,7 @@ function makeSpec(name, slots, colors) {
 function princessSpec() {
   return makeSpec("PRINCESS", { head: "egg", hair: "long", hat: "crown", face: "big",
                                 torso: "gown", arms: "robe", legs: "bare", shoes: "heel", item: "none" },
-                  { skin: WHITE, hair: SAND, hat: SAND, torso: RED, arms: RED, shoes: SAND });
+                  { skin: PEACH, hair: GOLD, hat: GOLD, torso: MAGENTA, arms: MAGENTA, shoes: GOLD });
 }
 
 /* Five pre-built characters. */
@@ -3693,13 +3793,13 @@ function prebuiltRoster() {
   return [
     princessSpec(),
     makeSpec("SIR BLOO", { hat: "helmet", torso: "armor", arms: "armor", legs: "armor", shoes: "boot", item: "sword", face: "dot" },
-             { hat: SILVER, torso: SKY, arms: SKY, legs: SLATE, shoes: DUSK, item: BLUE }),
+             { hat: SILVER, torso: SKY, arms: SKY, legs: SLATE, shoes: COCOA, item: SILVER, skin: TAN }),
     makeSpec("MERLA", { hat: "wizard", hair: "long", torso: "dress", arms: "robe", legs: "pants", shoes: "boot", item: "staff", face: "big", head: "egg" },
-             { hat: PLUM, hair: WHITE, torso: PLUM, arms: PLUM, legs: DUSK, shoes: DUSK, item: BLUE, skin: SAND }),
+             { hat: VIOLET, hair: WHITE, torso: VIOLET, arms: LILAC, legs: DUSK, shoes: COCOA, item: GOLD, skin: COCOA }),
     makeSpec("ZIP-7", { hat: "helmet", torso: "armor", arms: "long", legs: "armor", shoes: "boot", item: "flag", face: "shades", head: "square" },
-             { hat: WHITE, torso: WHITE, arms: WHITE, legs: WHITE, shoes: RED, item: GREEN, skin: ORANGE }),
+             { hat: WHITE, torso: WHITE, arms: WHITE, legs: SILVER, shoes: AQUA, item: AQUA, skin: SILVER }),
     makeSpec("PENNY", { hat: "cap", hair: "pony", torso: "overalls", arms: "short", legs: "shorts", shoes: "sneaker", item: "book", face: "freckle", head: "round" },
-             { hat: RED, hair: ORANGE, torso: SKY, arms: SAND, legs: NAVY, shoes: WHITE, item: GREEN })
+             { hat: RED, hair: RUST, torso: AQUA, arms: AQUA, legs: NAVY, shoes: CREAM, item: MOSS, skin: BROWN })
   ];
 }
 
@@ -4914,13 +5014,13 @@ function drawShowIntro(ctx, t) {
   if (half > 0) {
     for (const [x0, dir] of [[0, 1], [IW - half, -1]]) {
       rect(ctx, x0, 0, half, IH, RED);
-      for (let i = 4; i < half; i += 8) rect(ctx, dir > 0 ? half - i : IW - half + i, 0, 3, IH, PLUM);
+      for (let i = 4; i < half; i += 8) rect(ctx, dir > 0 ? half - i : IW - half + i, 0, 3, IH, WINE);
     }
   }
   if (half >= IW / 2 - 2 || t < 1600) {   // valance while mostly closed
     rect(ctx, 0, 0, IW, 10, RED);
     for (let x = 0; x < IW; x += 16) rect(ctx, x + 5, 10, 6, 3, RED);
-    rect(ctx, 0, 0, IW, 2, SAND);
+    rect(ctx, 0, 0, IW, 2, GOLD);
   }
   if (t < 1600) {                          // title card
     const title = (play.title && play.title.length) ? play.title : "A PIXEL PUPPETS SHOW";
