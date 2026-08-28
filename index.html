@@ -395,16 +395,67 @@ const ARM_LINES = [
   [[0,0],[1,1],[1,2],[2,3],[2,4],[2,5]],      // forward
   [[0,0],[0,1],[0,2],[0,3],[0,4],[0,5]],      // neutral (hanging)
   [[0,0],[-1,1],[-1,2],[-2,3],[-2,4],[-2,5]], // back
-  [[0,0],[-1,1],[-2,2],[-3,3],[-4,4],[-4,5]]  // fully back
+  [[0,0],[-1,1],[-2,2],[-3,3],[-4,4],[-4,5]], // fully back
+  // ---- pose-only frames (never used by the walk cycle) ----
+  [[0,0],[1,0],[2,0],[3,0],[4,0],[5,0]],      // 5: held straight out (POINT)
+  [[0,0],[1,-1],[1,-2],[2,-3],[2,-4],[2,-5]], // 6: raised overhead
+  [[0,0],[1,-1],[2,-2],[3,-3],[3,-4],[4,-5]]  // 7: overhead, tilted (WAVE b)
 ];
 const LEG_LINES = [
   [[0,0],[1,1],[2,2],[3,3],[3,4],[3,5]],      // fully forward (foot lifted)
   [[0,0],[1,1],[1,2],[2,3],[2,4],[2,5],[2,6]],// forward
   [[0,0],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6]],// neutral (standing)
   [[0,0],[-1,1],[-1,2],[-2,3],[-2,4],[-2,5],[-2,6]], // back
-  [[0,0],[-1,1],[-2,2],[-3,3],[-3,4],[-3,5]]  // fully back (foot lifted)
+  [[0,0],[-1,1],[-2,2],[-3,3],[-3,4],[-3,5]], // fully back (foot lifted)
+  // ---- pose-only frames ----
+  [[0,0],[1,0],[2,1],[3,1],[3,2],[3,3],[3,4]],// 5: thigh out, shin down (SIT)
+  [[0,0],[0,1],[-1,2],[-1,3],[-2,3],[-2,4]]   // 6: tucked up (JUMP)
 ];
 const NEUTRAL_FRAME = 2;   // index of the standing frame in the sets above
+
+/* ---- POSE LIBRARY -------------------------------------------------------
+   A pose freezes the limb frames instead of running the walk cycle. Every
+   pose is built from the same discrete limb frames as walking, so nothing
+   rotates and nothing new has to be drawn. HOLD poses stay until the puppet
+   is posed again, told to stand, or starts walking; timed poses (JUMP) run
+   out on their own. `arc` lifts the whole puppet along a sine hop, `dy`
+   lowers it (sitting). Poses record to the timeline like expressions, so a
+   sitting puppet is still sitting on playback and in the exported video.
+   To add a pose: add an entry here (and a limb centerline above if the
+   shape doesn't exist yet) plus one hotkey in POSE_KEYS.
+   ========================================================================*/
+const POSES = {
+  point: { name: "POINT", short: "PNT", hold: true,  armR: 5,      armL: 2, legR: 2, legL: 2 },
+  wave:  { name: "WAVE",  short: "WAV", hold: true,  armR: [6, 7], armL: 2, legR: 2, legL: 2, flapMs: 170 },
+  cheer: { name: "CHEER", short: "CHR", hold: true,  armR: 6,      armL: 6, legR: 2, legL: 2 },
+  jump:  { name: "JUMP",  short: "JMP", hold: false, armR: 6,      armL: 6, legR: 6, legL: 6, ms: 620, arc: 9 },
+  sit:   { name: "SIT",   short: "SIT", hold: true,  armR: 2,      armL: 2, legR: 5, legL: 5, dy: 4 }
+};
+const POSE_ORDER = ["point", "wave", "cheer", "jump", "sit"];
+
+/* Set (or clear) a pose. `elapsed` re-enters a pose part-way through, which
+   is what a playback seek needs. Recording is handled by poseAction. */
+function applyPose(p, kind, elapsed) {
+  elapsed = elapsed || 0;
+  const ps = kind ? POSES[kind] : null;
+  if (!ps) { p.pose = null; p.poseT = 0; p.poseAnimT = 0; return; }
+  p.poseAnimT = Math.max(0, elapsed);
+  if (ps.hold) { p.pose = kind; p.poseT = -1; return; }
+  const left = ps.ms - elapsed;
+  if (left <= 0) { p.pose = null; p.poseT = 0; return; }
+  p.pose = kind; p.poseT = left;
+}
+
+/* Vertical offset a pose adds to the whole puppet (hop arc / sitting drop). */
+function poseDy(p) {
+  const ps = p.pose ? POSES[p.pose] : null;
+  if (!ps) return 0;
+  if (ps.arc) {
+    const f = clamp(1 - (p.poseT / ps.ms), 0, 1);
+    return -Math.round(ps.arc * Math.sin(Math.PI * f));
+  }
+  return ps.dy || 0;
+}
 
 /* Build one limb frame: paint the centerline into a grid, return rows+meta.
    painter(i, n) -> palette char for point i of n ('4' skin, '9' recolor...). */
@@ -1319,6 +1370,11 @@ class Puppet {
     this.hitT = 0;                      // >0: reaction hop after being hit
     this.expression = null;             // active expression key (see EXPRESSIONS)
     this.exprT = 0;                     // remaining expression time
+    this.pose = null;                   // active pose key (see POSES)
+    this.poseT = 0;                     // ms left, or -1 for a held pose
+    this.poseAnimT = 0;                 // time in the pose (drives WAVE flap)
+    this.poseCancelled = false;         // walking broke a held pose this step
+    this.dubbed = false;                // driven by an overdub replay, not you
     this.abilityAt = 0;                 // last ability time (cooldown)
     this.vehicle = null;                // id of the vehicle this puppet drives
     this.bbox = { x: 0, y: 0, w: 0, h: 0 };
@@ -1330,6 +1386,14 @@ class Puppet {
   /* Advance idle/blink timers and walk cycle. dx = distance moved this step. */
   animate(dt, dx) {
     const speed = Math.abs(dx);
+    // walking breaks a held pose (a puppet can't stroll while sitting)
+    if (this.pose && this.poseT < 0 && speed > 0.06) {
+      this.pose = null; this.poseT = 0; this.poseCancelled = true;
+    }
+    if (this.pose) {
+      this.poseAnimT += dt;
+      if (this.poseT > 0) { this.poseT -= dt; if (this.poseT <= 0) { this.pose = null; this.poseT = 0; } }
+    }
     if (speed > 0.01) {
       this.moving = true;
       // Stride is tied to distance, not time: ~5px of travel per pose frame.
@@ -1354,6 +1418,13 @@ class Puppet {
   }
 
   frames() {
+    const ps = this.pose ? POSES[this.pose] : null;
+    if (ps) {
+      const armR = Array.isArray(ps.armR)
+        ? ps.armR[Math.floor(this.poseAnimT / (ps.flapMs || 200)) % ps.armR.length]
+        : ps.armR;
+      return { legR: ps.legR, legL: ps.legL, armR, armL: ps.armL, posed: true };
+    }
     const i = this.walkIdx;
     const legR = WALK_SEQ[i];
     const legL = WALK_SEQ[(i + 4) % WALK_SEQ.length];
@@ -1371,8 +1442,9 @@ function drawPuppet(ctx, p, opts) {
   // vehicle); opts.seated skips legs and shoes.
   const hitOff = p.hitT > 0 ? -((Math.floor(p.hitT / 70) % 2) * 2) : 0;
   const x = opts.at ? opts.at.x : p.x;
-  const y = (opts.at ? opts.at.y : p.y) + hitOff;
-  const bobIdx = p.moving ? BOB_SEQ[p.walkIdx % BOB_SEQ.length]
+  const y = (opts.at ? opts.at.y : p.y) + hitOff + (p.isProp ? 0 : poseDy(p));
+  const bobIdx = p.pose ? 0
+               : p.moving ? BOB_SEQ[p.walkIdx % BOB_SEQ.length]
                           : (Math.floor(p.breathT / 800) % 2);
   const bob = bobIdx;   // 0 or 1 px down
   let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
@@ -1397,7 +1469,7 @@ function drawPuppet(ctx, p, opts) {
   // (near) arm ducks behind on frames 3-4, the trailing (far) arm surfaces
   // in front on frames 0-1. Anti-phase arms mean they never collide in the
   // same layer. The held item travels with the leading arm.
-  const armRBehind = f.armR >= 3 && p.useT <= 0;
+  const armRBehind = !f.posed && f.armR >= 3 && p.useT <= 0;
   const armLFront = f.armL <= 1;
   const drawFrontArm = () => {
     armR.draw();
@@ -1797,6 +1869,8 @@ const PROP_DEFS = [
 function propDef(id) { for (const d of PROP_DEFS) if (d.id === id) return d; return PROP_DEFS[0]; }
 
 class Prop {
+  /* `dubbed` (set by an overdub replay) marks a prop as belonging to an
+     earlier layer: the live stage must not drive, drag or delete it. */
   constructor(propId, x, y, id) {
     this.id = id !== undefined ? id : nextPuppetId++;   // shared id space with puppets
     this.propId = propId;
@@ -2237,8 +2311,8 @@ function deliverBubble(meta, text) {
   const ev = { t: Math.max(0, meta.t), type: "bubble", id: meta.id, text, dur: showFor };
   if (recording && meta.session === recSession && meta.t >= 0) {
     recording.events.push(ev);                    // sorted at stopRecording
-  } else if (take && meta.session === recSession && meta.t >= 0) {
-    insertEventSorted(take.events, ev);           // arrived after STOP REC
+  } else if (lastLayer && meta.session === recSession && meta.t >= 0) {
+    insertEventSorted(lastLayer.events, ev);      // arrived after STOP REC
   }
   if (mode === "stage") liveBubble(meta.id, text, showFor);
 }
@@ -2559,6 +2633,26 @@ const EXPR_KEYS = {
   ARROWS: { KeyI: "cry", KeyJ: "angry", KeyK: "happy", KeyL: "laugh", KeyU: "disgust" }
 };
 
+/* Pose hotkeys, one cluster per player (P1 around WASD, P2 on the right-hand
+   keys next to the arrows). Pressing a held pose again stands the puppet up. */
+const POSE_KEYS = {
+  WASD:   { KeyQ: "point", KeyR: "wave", KeyF: "cheer", KeyG: "jump", KeyY: "sit" },
+  ARROWS: { KeyO: "point", KeyP: "wave", BracketLeft: "cheer", BracketRight: "jump", Semicolon: "sit" }
+};
+
+/* Trigger a pose for one puppet and record it. Same key twice = stand up. */
+function poseAction(p, kind) {
+  if (!p || p.isProp || !POSES[kind]) return;
+  if (p.pose === kind && POSES[kind].hold) { setPose(p, null); return; }
+  setPose(p, kind);
+}
+function setPose(p, kind) {
+  if (!p || p.isProp) return;
+  applyPose(p, kind, 0);
+  p.poseCancelled = false;
+  if (recording && !p.dubbed) recEvent({ type: "pose", id: p.id, kind: kind || null });
+}
+
 const held = new Set();          // e.code of every currently-held key
 let talkStack = [];              // scheme names, in press order (last = active)
 let textInput = null;            // {get,set,max} — routes typing when focused
@@ -2662,8 +2756,24 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
 /* ============================================================================
    PERFORMANCE CAPTURE — recording a show captures DATA, not pixels.
 
+   SHOW / SCENE / LAYER
+     A SHOW is an ordered list of SCENES. A SCENE is a stack of LAYERS.
+     Layer 1 is the base take. Every OVERDUB pass adds another layer, which
+     is performed while the earlier layers of that scene play back — so one
+     person can act opposite themselves, voicing and moving a second puppet
+     against their own first performance. Layers are independent: mute or
+     delete any one of them, or re-record a whole scene, and every other
+     scene and layer is untouched.
+
+     Each layer owns the entities it spawned. During an overdub the earlier
+     layers' puppets are replayed onto the live stage (flagged `dubbed`) and
+     cannot be grabbed, driven or deleted; only the new puppets are captured
+     into the new layer. Every layer carries its own mic recording, its own
+     amplitude track and its own speaker events, so each pass drives its own
+     puppet's mouth and all of them are mixed on playback and export.
+
    TIMELINE EVENT SCHEMA — each event: {t, type, ...} with t in ms relative
-   to the start of the take. Types:
+   to the start of the LAYER (all layers of a scene start at 0). Types:
      spawn    {id, spec, x, y, facing}   puppet added (full character spec is
                                          embedded so takes survive roster edits)
      remove   {id}                       puppet removed
@@ -2690,72 +2800,184 @@ display.addEventListener("contextmenu", (e) => e.preventDefault());
                                          here (null = stop the music)
      expr     {id, kind}                 facial expression (cry/angry/happy/
                                          laugh/disgust), shown for EXPR_MS
+     pose     {id, kind}                 pose from POSES (null = stand up)
    Props share the id space and the pos/layer/remove event types with
    puppets. Ability effects are transient eye-candy: they are re-spawned
    from ability events during playback, never stored as pixels.
    Keyboard motion is recorded exactly like dragging — as resulting position
    keyframes — so playback never replays input.
 
-   AMPLITUDE TRACK — take.amps is [[t, amp], ...] sampled ~30Hz while
-   recording; playback/export feed it through the same MouthQuantizer.
+   AMPLITUDE TRACK — layer.amps is [[t, amp], ...] sampled ~30Hz while
+   recording; playback/export feed it through that layer's MouthQuantizer.
 
    NARRATOR AUDIO — captured separately by a MediaRecorder on the raw mic
-   stream, kept in memory as a Blob. A take with no mic is simply silent.
+   stream, kept in memory as a Blob per layer. A layer with no mic is silent.
 
-   To add a new event type: emit it in recEvent(), apply it in applyEvent().
+   To add a new event type: emit it in recEvent(), apply it in Replay.apply().
    ==========================================================================*/
 
-let recording = null;   // {t0, events, amps, lastPos:Map, mediaRec, chunks}
-let take = null;        // {duration, events, amps, audioBlob, audioURL, keyframes:Map}
+/* ---- the show document -------------------------------------------------- */
+let nextLayerId = 1;
+let lastLayer = null;      // most recently finished layer (late captions land here)
+let layersOpen = true;     // layer panel visible on the stage
+
+let show = { title: "", scenes: [{ name: "SCENE 1", backdrop: 0, layers: [] }], cur: 0, saved: false };
+
+function curScene() {
+  show.cur = clamp(show.cur, 0, show.scenes.length - 1);
+  return show.scenes[show.cur];
+}
+function sceneLayers(sc) { return sc.layers.filter(L => !L.muted); }
+function sceneDur(sc) {
+  let d = 0;
+  for (const L of sceneLayers(sc)) d = Math.max(d, L.duration);
+  return d;
+}
+function recordedScenes() { return show.scenes.filter(sc => sceneDur(sc) > 0); }
+function showHasTakes() { return recordedScenes().length > 0; }
+function showDur() { let d = 0; for (const sc of recordedScenes()) d += sceneDur(sc); return d; }
+function markDirty() { show.saved = false; }
+
+function freeLayer(L) { if (L.audioURL) { URL.revokeObjectURL(L.audioURL); L.audioURL = null; } }
+function freeScene(sc) { for (const L of sc.layers) freeLayer(L); }
+
+/* Remove every entity that an overdub replay is driving from the live stage. */
+function clearDubbed() {
+  live.puppets = live.puppets.filter(p => !p.dubbed);
+  live.props = live.props.filter(p => !p.dubbed);
+  live.bubbles = (live.bubbles || []).filter(b => findEntity(live, b.id));
+  if (selected && selected.dubbed) selected = null;
+  if (dragging && dragging.p.dubbed) dragging = null;
+}
+
+function selectScene(i) {
+  if (recording) return;
+  show.cur = clamp(i, 0, show.scenes.length - 1);
+  clearDubbed();
+  const sc = curScene();
+  if (sc.layers.length) live.backdrop = sc.backdrop;
+  toast("NOW ON " + sc.name);
+}
+function renumberScenes() { show.scenes.forEach((sc, i) => { sc.name = "SCENE " + (i + 1); }); }
+function addScene() {
+  if (recording) return;
+  show.scenes.push({ name: "SCENE " + (show.scenes.length + 1), backdrop: live.backdrop, layers: [] });
+  show.cur = show.scenes.length - 1;
+  clearDubbed();
+  markDirty();
+  toast("ADDED " + curScene().name);
+}
+function clearScene(sc) { freeScene(sc); sc.layers = []; markDirty(); }
+function deleteScene(i) {
+  if (recording) return;
+  if (show.scenes.length <= 1) { clearScene(show.scenes[0]); toast("SCENE 1 CLEARED"); return; }
+  freeScene(show.scenes[i]);
+  show.scenes.splice(i, 1);
+  renumberScenes();
+  show.cur = clamp(i, 0, show.scenes.length - 1);
+  clearDubbed();
+  markDirty();
+  toast("SCENE DELETED");
+}
+function deleteLayer(sc, li) {
+  if (recording) return;
+  freeLayer(sc.layers[li]);
+  sc.layers.splice(li, 1);
+  sc.layers.forEach((L, k) => { L.name = "L" + (k + 1); });
+  markDirty();
+  toast("LAYER DELETED");
+}
+function newShowDoc() {
+  for (const sc of show.scenes) freeScene(sc);
+  show = { title: "", scenes: [{ name: "SCENE 1", backdrop: live.backdrop, layers: [] }], cur: 0, saved: false };
+  lastLayer = null;
+  clearDubbed();
+}
+
+/* Which characters a layer performed — shown in the layer list so you can
+   tell "the knight's pass" from "the wizard's pass" before deleting one. */
+function castOf(events) {
+  const names = [];
+  for (const ev of events)
+    if (ev.type === "spawn" && ev.spec && ev.spec.name && names.indexOf(ev.spec.name) < 0)
+      names.push(ev.spec.name);
+  if (!names.length) for (const ev of events)
+    if (ev.type === "spawnProp" && names.indexOf("PROPS") < 0) names.push("PROPS");
+  return names.join("+") || "STAGE";
+}
+
+/* ---- recording ---------------------------------------------------------- */
+let recording = null;   // {t0, events, amps, lastPos:Map, mediaRec, chunks, replay, scene}
 
 function recNow() { return Math.round(performance.now() - recording.t0); }
 function recEvent(ev) { ev.t = recNow(); recording.events.push(ev); }
 
-function startRecording() {
+/* overdub = keep the scene's existing layers and play them back while this
+   pass is captured; otherwise this is the scene's base take and replaces it. */
+function startRecording(overdub) {
+  const sc = curScene();
+  if (overdub && sceneDur(sc) <= 0) { toast("RECORD THE SCENE FIRST"); return false; }
+  if (!overdub) { clearDubbed(); clearScene(sc); }
   recSession++;
-  recording = { t0: performance.now(), events: [], amps: [], lastPos: new Map(), mediaRec: null, chunks: [] };
-  // Snapshot initial state at t=0 so playback can reconstruct the stage.
-  recording.events.push({ t: 0, type: "backdrop", index: live.backdrop });
-  recording.events.push({ t: 0, type: "weather", kind: live.weather });
-  // theme song: whatever is cued live wins, else the studio's "next show"
-  // pick. Restarted at t=0 and recorded as the take's first music event.
-  const tr = music.playing ? music.playing.track : currentTrack();
-  recording.trackData = tr ? JSON.parse(JSON.stringify(tr)) : null;
-  if (tr) {
-    recording.events.push({ t: 0, type: "music", trackData: recording.trackData });
-    playTrack(tr, {});
+  recording = { t0: performance.now(), events: [], amps: [], lastPos: new Map(),
+                mediaRec: null, chunks: [], overdub: !!overdub, replay: null, scene: sc };
+  if (overdub) {
+    // the replay owns the earlier layers' puppets: pull any live copies off
+    // the stage first so nothing is on it twice
+    const R = makeReplay(sc, live, { live: true });
+    live.puppets = live.puppets.filter(p => !R.ownedIds.has(p.id));
+    live.props = live.props.filter(p => !R.ownedIds.has(p.id));
+    if (selected && R.ownedIds.has(selected.id)) selected = null;
+    dragging = null;
+    recording.replay = R;
+    R.seek(0);
+  } else {
+    // base take: the scene's opening state is this layer's t=0 snapshot
+    sc.backdrop = live.backdrop;
+    recording.events.push({ t: 0, type: "backdrop", index: live.backdrop });
+    recording.events.push({ t: 0, type: "weather", kind: live.weather });
+    const tr = music.playing ? music.playing.track : currentTrack();
+    if (tr) {
+      recording.events.push({ t: 0, type: "music", trackData: JSON.parse(JSON.stringify(tr)) });
+      playTrack(tr, {});
+    }
   }
   for (const p of live.puppets) {
+    if (p.dubbed) continue;
     recording.events.push({ t: 0, type: "spawn", id: p.id, spec: p.spec, x: p.x, y: p.y, facing: p.facing });
     if (p.layerMode === "manual")
       recording.events.push({ t: 0, type: "layer", id: p.id, mode: "manual", z: p.manualZ });
+    if (p.pose) recording.events.push({ t: 0, type: "pose", id: p.id, kind: p.pose });
     recording.lastPos.set(p.id, { x: p.x, y: p.y, t: 0 });
   }
   for (const v of live.props) {
+    if (v.dubbed) continue;
     recording.events.push({ t: 0, type: "spawnProp", id: v.id, propId: v.propId, x: v.x, y: v.y });
     if (v.layerMode === "manual")
       recording.events.push({ t: 0, type: "layer", id: v.id, mode: "manual", z: v.manualZ });
     recording.lastPos.set(v.id, { x: v.x, y: v.y, t: 0 });
   }
   for (const p of live.puppets)
-    if (p.vehicle) recording.events.push({ t: 0, type: "board", id: p.id, vid: p.vehicle });
+    if (!p.dubbed && p.vehicle) recording.events.push({ t: 0, type: "board", id: p.id, vid: p.vehicle });
   recording.events.push({ t: 0, type: "speaker", id: -1 });
   recording.lastSpeaker = -1;
-  recording.lastAmp = -1;
   if (mic.ok && mic.stream && window.MediaRecorder) {
     try {
-      const rec = recording;   // handler closes over the take, not the global
+      const rec = recording;   // handler closes over the pass, not the global
       rec.mediaRec = new MediaRecorder(mic.stream);
       rec.mediaRec.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
       rec.mediaRec.start();
     } catch (err) { recording.mediaRec = null; }
   }
+  return true;
 }
 
-/* Called every fixed step while recording. */
+/* Called every fixed step while recording. Replayed (dubbed) entities belong
+   to earlier layers and are never re-captured. */
 function recordSample(speakerId, amp) {
   const t = recNow();
   for (const p of [...live.puppets, ...live.props]) {
+    if (p.dubbed) continue;
     const last = recording.lastPos.get(p.id);
     if (!last || ((last.x !== p.x || last.y !== p.y) && t - last.t >= 33)) {
       recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
@@ -2774,24 +2996,31 @@ function recordSample(speakerId, amp) {
 
 function stopRecording() {
   const rec = recording;
+  const sc = rec.scene;
   const duration = recNow();
+  if (rec.replay) rec.replay.dispose();
   stopMusic();
   // final position keyframe for everything so playback ends in place
-  for (const p of [...live.puppets, ...live.props]) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
+  for (const p of [...live.puppets, ...live.props])
+    if (!p.dubbed) recEvent({ type: "pos", id: p.id, x: p.x, y: p.y });
   const finalize = (audioBlob) => {
-    if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
     // async captions may have landed out of order — keep the timeline sorted
     rec.events.sort((a, b) => a.t - b.t);
-    take = {
+    const L = {
+      id: nextLayerId++,
+      name: "L" + (sc.layers.length + 1),
+      cast: castOf(rec.events),
       duration: Math.max(duration, 100),
-      title: "",
-      trackData: rec.trackData || null,
       events: rec.events,
       amps: rec.amps,
       audioBlob,
       audioURL: audioBlob ? URL.createObjectURL(audioBlob) : null,
-      keyframes: buildKeyframes(rec.events)
+      keyframes: buildKeyframes(rec.events),
+      muted: false
     };
+    sc.layers.push(L);
+    lastLayer = L;
+    markDirty();
   };
   if (rec.mediaRec && rec.mediaRec.state !== "inactive") {
     rec.mediaRec.onstop = () => finalize(new Blob(rec.chunks, { type: rec.mediaRec.mimeType || "audio/webm" }));
@@ -2806,10 +3035,7 @@ function stopRecording() {
 function buildKeyframes(events) {
   const map = new Map();
   for (const ev of events) {
-    if (ev.type === "spawn" || ev.type === "spawnProp") {
-      if (!map.has(ev.id)) map.set(ev.id, []);
-      map.get(ev.id).push({ t: ev.t, x: ev.x, y: ev.y });
-    } else if (ev.type === "pos") {
+    if (ev.type === "spawn" || ev.type === "spawnProp" || ev.type === "pos") {
       if (!map.has(ev.id)) map.set(ev.id, []);
       map.get(ev.id).push({ t: ev.t, x: ev.x, y: ev.y });
     }
@@ -2817,264 +3043,366 @@ function buildKeyframes(events) {
   return map;
 }
 
-function discardTake() {
-  if (take && take.audioURL) URL.revokeObjectURL(take.audioURL);
-  take = null;
+function layerURL(L) {
+  if (!L.audioURL && L.audioBlob) L.audioURL = URL.createObjectURL(L.audioBlob);
+  return L.audioURL || null;
 }
 /* ============================================================================
-   PLAYBACK — replays a take by driving the same renderer from the timeline
-   instead of live input. If the take has narrator audio, the <audio> element
-   is the clock source so picture and sound stay locked; otherwise a simple
-   accumulator clock is used. Walk cycles are regenerated from interpolated
-   position deltas exactly as they are live — animation is never stored.
+   REPLAY — one scene's layers played back together onto a state object.
+   The SAME machinery serves three jobs:
+     playback  state = play.state, its own puppets, audio drives the clock
+     export    ditto, with every audio track routed into the encoder's mix
+     overdub   state = the LIVE stage, replayed puppets flagged `dubbed`,
+               clock slaved to the recording clock so the new pass lines up
+   Nothing about drawing changes: replayed puppets are ordinary Puppets that
+   happen to be driven from a timeline instead of from hands and keys.
+   ==========================================================================*/
+
+function makeReplay(scene, state, opts) {
+  opts = opts || {};
+  const layers = sceneLayers(scene);
+  const R = {
+    scene, state, layers,
+    live: !!opts.live,
+    dest: opts.dest || null,
+    offset: opts.offset || 0,      // this scene's start within the whole show
+    t: 0, wallBase: 0, anyJaw: false,
+    duration: Math.max(sceneDur(scene), 1),
+    ownedIds: new Set(),
+    keyframes: new Map(),
+    eventIdx: [], ampIdx: [], speakers: [], mouths: [], audios: [],
+    clockAudio: null,
+    musicEv: null, musicApplied: {},
+    musicOuts: opts.dest ? [opts.dest] : null
+  };
+  let bestDur = -1;
+  for (const L of layers) {
+    for (const ev of L.events)
+      if (ev.type === "spawn" || ev.type === "spawnProp") R.ownedIds.add(ev.id);
+    if (!L.keyframes) L.keyframes = buildKeyframes(L.events);
+    for (const [id, kf] of L.keyframes) {
+      const cur = R.keyframes.get(id);
+      R.keyframes.set(id, cur ? cur.concat(kf).sort((a, b) => a.t - b.t) : kf);
+    }
+    R.eventIdx.push(0); R.ampIdx.push(0); R.speakers.push(-1);
+    R.mouths.push(new MouthQuantizer());
+    let a = null;
+    const url = layerURL(L);
+    if (url) {
+      // Fresh element every replay: a MediaElementSource permanently claims
+      // its element, and export must route audio ONLY into the mix.
+      a = new Audio(url);
+      if (R.dest) { try { audioCtx().createMediaElementSource(a).connect(R.dest); } catch (e) {} }
+      if (!R.live && L.duration > bestDur) { bestDur = L.duration; R.clockAudio = a; }
+    }
+    R.audios.push(a);
+  }
+
+  /* show-clock -> the clock the state's bubbles and wipes are measured in */
+  R.wall = (ts) => R.live ? R.wallBase + ts : R.offset + ts;
+
+  R.reset = function () {
+    const st = R.state;
+    st.puppets = st.puppets.filter(p => !R.ownedIds.has(p.id));
+    st.props = st.props.filter(p => !R.ownedIds.has(p.id));
+    st.bubbles = (st.bubbles || []).filter(b => !R.ownedIds.has(b.id));
+    if (!R.live) { st.effects = []; st.weather = "none"; st.wipeAt = -1e9; }
+    for (let i = 0; i < R.layers.length; i++) {
+      R.eventIdx[i] = 0; R.ampIdx[i] = 0; R.speakers[i] = -1; R.mouths[i].reset();
+    }
+    R.musicEv = null; R.musicApplied = {};
+  };
+
+  /* Rebuild the scene at time t by re-applying every layer from the start.
+     Event counts are small (sparse sampling), so a scrub re-scan is cheap. */
+  R.seek = function (t) {
+    t = clamp(t, 0, R.duration);
+    R.reset();
+    R.t = t;
+    R.wallBase = performance.now() - t;
+    for (let i = 0; i < R.layers.length; i++) {
+      const evs = R.layers[i].events;
+      while (R.eventIdx[i] < evs.length && evs[R.eventIdx[i]].t <= t) R.apply(i, evs[R.eventIdx[i]++]);
+    }
+    R.positions(t, 0);
+    for (const a of R.audios) if (a) { try { a.currentTime = t / 1000; } catch (e) {} }
+  };
+
+  R.play = function () { for (const a of R.audios) if (a) a.play().catch(() => {}); };
+  R.pause = function () { for (const a of R.audios) if (a) a.pause(); };
+  R.dispose = function () {
+    R.pause();
+    for (const a of R.audios) if (a) { try { a.src = ""; } catch (e) {} }
+    R.audios = [];
+    R.clockAudio = null;
+    stopMusic();
+  };
+
+  /* The narration <audio> is the clock while it has data; if it is shorter
+     than the timeline (or absent) the accumulator takes over, so a scene
+     always reaches its end. Overdub is slaved to the recording clock. */
+  R.advance = function (dt) {
+    const a = R.clockAudio;
+    if (a && !a.ended && a.currentTime > 0 && !isNaN(a.currentTime)) R.t = a.currentTime * 1000;
+    else R.t += dt;
+    return R.t;
+  };
+
+  R.ampAt = function (i, t) {
+    const amps = R.layers[i].amps;
+    if (!amps || !amps.length) return 0;
+    let k = R.ampIdx[i];
+    while (k < amps.length - 1 && amps[k + 1][0] <= t) k++;
+    while (k > 0 && amps[k][0] > t) k--;
+    R.ampIdx[i] = k;
+    return amps[k][1];
+  };
+
+  /* Interpolate between position keyframes, floor to integers at assignment,
+     and feed the deltas into the same walk-cycle logic used live. */
+  R.positions = function (t, dt) {
+    const st = R.state;
+    for (const p of [...st.puppets, ...(st.props || [])]) {
+      if (!R.ownedIds.has(p.id)) continue;
+      const kf = R.keyframes.get(p.id);
+      if (!kf || !kf.length) continue;
+      let a = kf[0], b = kf[kf.length - 1];
+      for (let i = 0; i < kf.length; i++) {
+        if (kf[i].t <= t) a = kf[i];
+        if (kf[i].t >= t) { b = kf[i]; break; }
+      }
+      const span = b.t - a.t;
+      const f = span > 0 ? clamp((t - a.t) / span, 0, 1) : 0;
+      const nx = lerp(a.x, b.x, f), ny = lerp(a.y, b.y, f);
+      const dx = nx - p.fx;
+      if (dx > 0.05) p.facing = 1; else if (dx < -0.05) p.facing = -1;
+      p.setPos(nx, ny);
+      if (p.isProp) { p.animT += dt; p.wheelPhase += Math.abs(dx) * 0.25; if (p.wobbleT > 0) p.wobbleT -= dt; }
+      else { p.animate(dt, p.vehicle ? 0 : dx); p.poseCancelled = false; }
+    }
+    for (const p of st.puppets) {          // a rider's facing follows its ride
+      if (!R.ownedIds.has(p.id) || !p.vehicle) continue;
+      const v = findEntity(st, p.vehicle);
+      if (v) p.facing = v.facing;
+    }
+  };
+
+  R.step = function (t, dt) {
+    R.t = t;
+    for (let i = 0; i < R.layers.length; i++) {
+      const evs = R.layers[i].events;
+      while (R.eventIdx[i] < evs.length && evs[R.eventIdx[i]].t <= t) R.apply(i, evs[R.eventIdx[i]++]);
+    }
+    R.positions(t, dt);
+    if (R.musicEv !== R.musicApplied) {   // cue change (or a resume/seek)
+      R.musicApplied = R.musicEv;
+      const mev = R.musicEv;
+      if (mev && mev.trackData)
+        playTrack(mev.trackData, { offsetMs: Math.max(0, t - mev.t), outs: R.musicOuts || undefined });
+      else stopMusic();
+    }
+    // one mouth per layer: each pass drives the puppet IT was speaking as
+    const jaws = new Map();
+    let anyJaw = false;
+    for (let i = 0; i < R.layers.length; i++) {
+      const jaw = R.mouths[i].update(R.ampAt(i, t), dt);
+      if (jaw > 0) anyJaw = true;
+      const sid = R.speakers[i];
+      if (sid >= 0) jaws.set(sid, Math.max(jaw, jaws.get(sid) || 0));
+    }
+    for (const p of R.state.puppets) if (R.ownedIds.has(p.id)) p.jaw = jaws.get(p.id) || 0;
+    R.anyJaw = anyJaw;
+    if (!R.live) updateEffects(R.state, dt);
+    return anyJaw;
+  };
+
+  R.apply = function (li, ev) {
+    const st = R.state;
+    const findP = (id) => { for (const p of st.puppets) if (p.id === id) return p; return null; };
+    switch (ev.type) {
+      case "spawn": {
+        const p = new Puppet(ev.spec, ev.x, ev.y, ev.id);
+        p.facing = ev.facing || 1;
+        p.dubbed = R.live;
+        st.puppets.push(p);
+        break;
+      }
+      case "spawnProp": {
+        const v = new Prop(ev.propId, ev.x, ev.y, ev.id);
+        v.dubbed = R.live;
+        st.props.push(v);
+        break;
+      }
+      case "remove":
+        st.puppets = st.puppets.filter(p => p.id !== ev.id);
+        st.props = st.props.filter(p => p.id !== ev.id);
+        break;
+      case "pos": break;   // handled by keyframe interpolation
+      case "layer": {
+        const p = findEntity(st, ev.id);
+        if (p) { p.layerMode = ev.mode; p.manualZ = ev.z || 0; }
+        break;
+      }
+      case "backdrop": st.backdrop = ev.index; break;
+      case "speaker": R.speakers[li] = ev.id; break;
+      case "ability": { const p = findP(ev.id); if (p) spawnAbility(st, p); break; }
+      case "interact": {
+        // cosmetic only: state changes (ball arcs, nudges, removals) replay
+        // through pos keyframes and remove events
+        const v = findEntity(st, ev.pid);
+        const p = findP(ev.id);
+        if (p) p.useT = 260;
+        if (v) propFX(st, v, ev.result);
+        break;
+      }
+      case "board": { const p = findP(ev.id); if (p) p.vehicle = ev.vid; break; }
+      case "unboard": { const p = findP(ev.id); if (p) p.vehicle = null; break; }
+      case "bubble": {
+        st.bubbles = (st.bubbles || []).filter(b => b.id !== ev.id);
+        st.bubbles.push({ id: ev.id, text: ev.text, until: R.wall(ev.t + ev.dur) });
+        break;
+      }
+      case "weather": st.weather = ev.kind; break;
+      case "wipe": st.wipeAt = R.wall(ev.t); break;
+      case "music": R.musicEv = ev.trackData ? ev : null; break;
+      case "expr": {
+        const p = findP(ev.id);
+        if (p) {   // on a seek, only whatever of the window remains
+          p.exprT = Math.max(0, EXPR_MS - (R.t - ev.t));
+          p.expression = p.exprT > 0 ? ev.kind : null;
+        }
+        break;
+      }
+      case "pose": { const p = findP(ev.id); if (p) applyPose(p, ev.kind, R.t - ev.t); break; }
+    }
+  };
+
+  return R;
+}
+/* ============================================================================
+   PLAYBACK — replays a queue of scenes back to back by driving the same
+   renderer from their timelines instead of from live input. One scene at a
+   time is live in `play.R`; the transport works in whole-show time so a
+   three-scene show scrubs as one continuous piece.
    ==========================================================================*/
 
 const play = {
   active: false,
   exporting: false,
-  take: null,           // the take being replayed (current or from the library)
-  returnTo: "stage",    // where STOP goes back to: "stage" | "library"
-  t: 0,
-  playing: false,
-  puppets: [],          // separate instances; the live stage is untouched
-  props: [],
-  effects: [],
-  bubbles: [],
-  weather: "none",
-  wipeAt: -1e9,
-  musicEv: null,        // active {t, trackData} music event (null = silence)
-  musicApplied: null,   // last event actually started, to detect changes
-  musicOuts: null,      // where the synth routes (export sets the mix node)
-  backdrop: 0,
-  speakerId: -1,
-  eventIdx: 0,
-  ampIdx: 0,
-  audio: null,          // <audio> clock when the take has narration
-  mouth: new MouthQuantizer(),
-  ended: false
+  queue: [], starts: [], total: 1, pad: 0, qi: 0,
+  R: null,
+  state: { puppets: [], props: [], effects: [], bubbles: [], weather: "none", wipeAt: -1e9, backdrop: 0 },
+  playing: false, ended: false,
+  returnTo: "stage",       // where STOP goes back to: "stage" | "library"
+  title: "", musicName: null,
+  dest: null,              // export mix node (null = play to the speakers)
+  t: 0                     // whole-show time
 };
 
-/* The narration <audio> is the clock while it has data; if the audio track is
-   shorter than the timeline (or absent) the accumulator clock takes over so
-   playback always reaches the end of the take. */
-function playbackClock() {
-  if (play.audio && !play.audio.ended && !isNaN(play.audio.currentTime)) return play.audio.currentTime * 1000;
-  return play.t;
+function playbackClock() { return play.t; }
+
+function buildQueue(scenes) {
+  play.queue = scenes;
+  play.starts = [];
+  let acc = 0;
+  for (const sc of scenes) { play.starts.push(acc); acc += Math.max(sceneDur(sc), 1); }
+  // a show shorter than the curtain animation gets a held tail on its last
+  // scene, so the curtain still has time to open and shut over the picture
+  play.pad = Math.max(0, 2200 - acc);
+  play.total = Math.max(acc + play.pad, 1);
+  play.musicName = null;
+  for (const sc of scenes) {
+    for (const L of sceneLayers(sc))
+      for (const ev of L.events)
+        if (ev.type === "music" && ev.trackData) { play.musicName = ev.trackData.name; break; }
+    if (play.musicName) break;
+  }
+}
+function disposeReplay() { if (play.R) { play.R.dispose(); play.R = null; } }
+
+function gotoScene(qi, localT, wipe) {
+  disposeReplay();
+  play.qi = clamp(qi, 0, play.queue.length - 1);
+  const sc = play.queue[play.qi];
+  const st = play.state;
+  st.puppets = []; st.props = []; st.effects = []; st.bubbles = [];
+  st.weather = "none"; st.wipeAt = -1e9; st.backdrop = sc.backdrop || 0;
+  const R = makeReplay(sc, st, { dest: play.dest, offset: play.starts[play.qi] });
+  if (play.qi === play.queue.length - 1) R.duration += play.pad;   // held tail
+  play.R = R;
+  R.seek(localT);
+  play.t = play.starts[play.qi] + R.t;
+  if (wipe) st.wipeAt = play.t;
+  if (play.playing) R.play();
 }
 
-function enterPlayback(t, returnTo) {
-  if (!t) return;
+function enterPlayback(scenes, title, returnTo) {
+  if (!scenes || !scenes.length) { toast("NOTHING RECORDED YET"); return; }
   stopMusic();               // a live cue doesn't bleed into playback
   mode = "playback";
-  play.take = t;
   play.returnTo = returnTo || "stage";
+  play.title = title || "";
   play.active = true;
   play.exporting = false;
-  play.musicOuts = null;     // playback music goes to the speakers
-  if (t.audioURL) {
-    play.audio = new Audio(t.audioURL);
-  } else play.audio = null;
-  seekPlayback(0);
-  resumePlayback();
+  play.dest = null;
+  play.ended = false;
+  play.playing = true;
+  buildQueue(scenes);
+  gotoScene(0, 0, false);
 }
 
 function resumePlayback() {
-  if (play.ended || playbackClock() >= play.take.duration - 1) seekPlayback(0);
   play.playing = true;
   play.ended = false;
-  if (play.audio) play.audio.play().catch(() => { play.audio = null; });
-  play.musicApplied = {};   // force the next step to re-sync the music cue
+  if (play.t >= play.total - 1) { gotoScene(0, 0, false); return; }
+  if (play.R) { play.R.play(); play.R.musicApplied = {}; }
 }
 function pausePlayback() {
   play.playing = false;
-  if (play.audio) play.audio.pause();
+  if (play.R) { play.R.pause(); play.R.musicApplied = {}; }
   stopMusic();
-  play.musicApplied = {};
 }
 function exitPlayback() {
   pausePlayback();
+  disposeReplay();
   play.active = false;
-  play.puppets = [];
-  play.props = [];
-  play.effects = [];
-  play.audio = null;
+  const st = play.state;
+  st.puppets = []; st.props = []; st.effects = []; st.bubbles = [];
   mode = play.returnTo || "stage";
 }
-
-/* Rebuild playback state at time t by re-applying events from the start.
-   Event counts are small (sparse sampling), so a scrub re-scan is cheap. */
 function seekPlayback(t) {
-  t = clamp(t, 0, play.take.duration);
-  play.puppets = [];
-  play.props = [];
-  play.effects = [];      // transient effects don't survive a scrub — fine
-  play.bubbles = [];
-  play.weather = "none";
-  play.wipeAt = -1e9;
-  // legacy takes carried one track with no music events — treat it as a cue
-  // at t=0; newer takes set musicEv through their music events below
-  if (play.take._hasMusicEv === undefined)
-    play.take._hasMusicEv = play.take.events.some(e => e.type === "music");
-  play.musicEv = (!play.take._hasMusicEv && play.take.trackData)
-    ? { t: 0, trackData: play.take.trackData } : null;
-  play.musicApplied = {};
-  play.backdrop = live.backdrop;
-  play.speakerId = -1;
-  play.eventIdx = 0;
-  play.ampIdx = 0;
-  play.mouth.reset();
-  play.t = t;
+  t = clamp(t, 0, play.total);
+  let qi = 0;
+  for (let i = 0; i < play.starts.length; i++) if (t >= play.starts[i]) qi = i;
+  const wasPlaying = play.playing;
+  play.playing = false;
+  gotoScene(qi, t - play.starts[qi], false);
   play.ended = false;
-  while (play.eventIdx < play.take.events.length && play.take.events[play.eventIdx].t <= t)
-    applyEvent(play.take.events[play.eventIdx++]);
-  updatePlaybackPositions(t, 0);
-  if (play.audio) { try { play.audio.currentTime = t / 1000; } catch (e) {} }
-}
-
-function findPlayPuppet(id) {
-  for (const p of play.puppets) if (p.id === id) return p;
-  return null;
-}
-
-function applyEvent(ev) {
-  switch (ev.type) {
-    case "spawn": {
-      const p = new Puppet(ev.spec, ev.x, ev.y, ev.id);
-      p.facing = ev.facing || 1;
-      play.puppets.push(p);
-      break;
-    }
-    case "spawnProp": {
-      play.props.push(new Prop(ev.propId, ev.x, ev.y, ev.id));
-      break;
-    }
-    case "remove": {
-      play.puppets = play.puppets.filter(p => p.id !== ev.id);
-      play.props = play.props.filter(p => p.id !== ev.id);
-      break;
-    }
-    case "pos": break;   // handled by keyframe interpolation
-    case "layer": {
-      const p = findEntity(play, ev.id);
-      if (p) { p.layerMode = ev.mode; p.manualZ = ev.z || 0; }
-      break;
-    }
-    case "backdrop": play.backdrop = ev.index; break;
-    case "speaker": play.speakerId = ev.id; break;
-    case "ability": {
-      const p = findPlayPuppet(ev.id);
-      if (p) spawnAbility(play, p);
-      break;
-    }
-    case "interact": {
-      // cosmetic only: state changes (ball arcs, nudges, removals) replay
-      // through pos keyframes and remove events
-      const v = findEntity(play, ev.pid);
-      const p = findPlayPuppet(ev.id);
-      if (p) p.useT = 260;
-      if (v) propFX(play, v, ev.result);
-      break;
-    }
-    case "board": {
-      const p = findPlayPuppet(ev.id);
-      if (p) p.vehicle = ev.vid;
-      break;
-    }
-    case "unboard": {
-      const p = findPlayPuppet(ev.id);
-      if (p) p.vehicle = null;
-      break;
-    }
-    case "bubble": {
-      play.bubbles = play.bubbles.filter(b => b.id !== ev.id);
-      play.bubbles.push({ id: ev.id, text: ev.text, until: ev.t + ev.dur });
-      break;
-    }
-    case "weather": play.weather = ev.kind; break;
-    case "wipe": play.wipeAt = ev.t; break;   // rendered from show-time
-    case "music": play.musicEv = ev.trackData ? ev : null; break;
-    case "expr": {
-      const p = findPlayPuppet(ev.id);
-      if (p) {
-        // on a seek, only whatever of the expression window remains
-        p.exprT = Math.max(0, EXPR_MS - (playbackClock() - ev.t));
-        p.expression = p.exprT > 0 ? ev.kind : null;
-      }
-      break;
-    }
-  }
-}
-
-/* Interpolate between position keyframes, floor to integers at assignment,
-   and feed the deltas into the same walk-cycle logic used live. */
-function updatePlaybackPositions(t, dt) {
-  for (const p of [...play.puppets, ...play.props]) {
-    const kf = play.take.keyframes.get(p.id);
-    if (!kf || !kf.length) continue;
-    let a = kf[0], b = kf[kf.length - 1];
-    for (let i = 0; i < kf.length; i++) {
-      if (kf[i].t <= t) a = kf[i];
-      if (kf[i].t >= t) { b = kf[i]; break; }
-    }
-    const span = b.t - a.t;
-    const f = span > 0 ? clamp((t - a.t) / span, 0, 1) : 0;
-    const nx = lerp(a.x, b.x, f), ny = lerp(a.y, b.y, f);
-    const dx = nx - p.fx;
-    if (dx > 0.05) p.facing = 1; else if (dx < -0.05) p.facing = -1;
-    p.setPos(nx, ny);
-    if (p.isProp) { p.animT += dt; p.wheelPhase += Math.abs(dx) * 0.25; if (p.wobbleT > 0) p.wobbleT -= dt; }
-    else p.animate(dt, p.vehicle ? 0 : dx);   // no walk cycle while riding
-  }
-  // a boarded puppet's facing follows its vehicle
-  for (const p of play.puppets) {
-    if (!p.vehicle) continue;
-    const v = findEntity(play, p.vehicle);
-    if (v) p.facing = v.facing;
-  }
-}
-
-function currentAmp(t) {
-  const amps = play.take.amps;
-  if (!amps.length) return 0;
-  while (play.ampIdx < amps.length - 1 && amps[play.ampIdx + 1][0] <= t) play.ampIdx++;
-  while (play.ampIdx > 0 && amps[play.ampIdx][0] > t) play.ampIdx--;
-  return amps[play.ampIdx][1];
+  if (wasPlaying) { play.playing = true; play.R.play(); play.R.musicApplied = {}; }
 }
 
 /* Advance playback by one fixed step. Shared by playback mode and export. */
 function stepPlayback(dt) {
-  if (!play.playing) return;
-  if (!play.audio || play.audio.ended) play.t += dt;
-  else play.t = play.audio.currentTime * 1000;   // stay synced for takeover
-  const t = playbackClock();
-  while (play.eventIdx < play.take.events.length && play.take.events[play.eventIdx].t <= t)
-    applyEvent(play.take.events[play.eventIdx++]);
-  updatePlaybackPositions(t, dt);
-  // music cue changes (or a resume/seek) restart the synth mid-pattern
-  if (play.musicEv !== play.musicApplied) {
-    play.musicApplied = play.musicEv;
-    const mev = play.musicEv;
-    if (mev && mev.trackData)
-      playTrack(mev.trackData, { offsetMs: Math.max(0, t - mev.t), outs: play.musicOuts || undefined });
-    else stopMusic();
-  }
-  const amp = currentAmp(t);
-  const jaw = play.mouth.update(amp, dt);
-  for (const p of play.puppets) p.jaw = (p.id === play.speakerId) ? jaw : 0;
-  duckMusic(jaw > 0);
-  updateEffects(play, dt);
-  if (t >= play.take.duration) {
-    play.playing = false;
-    play.ended = true;
-    if (play.audio) play.audio.pause();
-    if (play.exporting) finishExport();
-    else stopMusic();
-  }
+  if (!play.playing || !play.R) return;
+  const R = play.R;
+  const localT = R.advance(dt);
+  const clipped = Math.min(localT, R.duration);
+  play.t = play.starts[play.qi] + clipped;
+  R.step(clipped, dt);
+  duckMusic(R.anyJaw);
+  if (localT < R.duration) return;
+  if (play.qi < play.queue.length - 1) { gotoScene(play.qi + 1, 0, true); return; }
+  play.playing = false;
+  play.ended = true;
+  R.pause();
+  if (play.exporting) finishExport();
+  else stopMusic();
 }
 /* ============================================================================
    VIDEO EXPORT — plays the timeline from the start (never re-performing the
    show) while capturing an export canvas sized to an exact integer multiple
-   of 320x180 (4x = 1280x720, so the file contains no resampling).
+   of 320x180 (4x = 1280x720, so the file contains no resampling). Every
+   layer's narration and the music cues are mixed into one audio track.
 
    Frame pacing: the canvas stream is created with captureStream(0) and every
    frame is pushed explicitly with requestFrame() on an even 30fps grid of
@@ -3088,7 +3416,7 @@ function stepPlayback(dt) {
 
 const EXPORT_SCALE = 4;
 const EXPORT_FPS = 30;
-let exporter = null;   // {canvas, ctx, recorder, chunks, audio, mimeType, ...}
+let exporter = null;   // {canvas, ctx, recorder, chunks, mimeType, ...}
 
 /* An interval that keeps firing in background tabs (falls back to a plain
    setInterval when Workers/blob URLs are unavailable). */
@@ -3114,8 +3442,17 @@ const EXPORT_FORMATS = [
   ["video/webm", "webm"]
 ];
 
-function startExport(t, returnTo, isRetry) {
-  if (!t || exporter) return;
+function scenesHaveSound(scenes) {
+  for (const sc of scenes)
+    for (const L of sceneLayers(sc)) {
+      if (L.audioBlob) return true;
+      for (const ev of L.events) if (ev.type === "music" && ev.trackData) return true;
+    }
+  return false;
+}
+
+function startExport(scenes, title, returnTo, isRetry) {
+  if (!scenes || !scenes.length || exporter) return;
   const [cv, cx] = makeCanvas(IW * EXPORT_SCALE, IH * EXPORT_SCALE);
   let mimeType = "", ext = "webm";
   if (window.MediaRecorder) {
@@ -3137,24 +3474,16 @@ function startExport(t, returnTo, isRetry) {
   if (vtrack && typeof vtrack.requestFrame === "function") reqFrame = () => vtrack.requestFrame();
   else if (typeof stream.requestFrame === "function") reqFrame = () => stream.requestFrame();
   else stream = cv.captureStream(30);
-  const hasMusic = !!t.trackData || t.events.some(e => e.type === "music" && e.trackData);
-  let audioEl = null, dest = null;
-  if (t.audioURL || hasMusic) {
+  let dest = null;
+  if (scenesHaveSound(scenes)) {
     const ctx = audioCtx();
     dest = ctx.createMediaStreamDestination();
     for (const tr of dest.stream.getAudioTracks()) stream.addTrack(tr);
   }
-  if (t.audioURL) {
-    // Fresh element each export: a MediaElementSource permanently claims its
-    // element. Routed ONLY to the destination node, so exporting is silent.
-    audioEl = new Audio(t.audioURL);
-    const src = audioCtx().createMediaElementSource(audioEl);
-    src.connect(dest);
-  }
   const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8000000 });
-  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], audio: audioEl, mimeType, ext,
-               reqFrame, lastCapMs: -1e9, finishing: false,
-               take: t, returnTo: returnTo || "stage", isRetry: !!isRetry };
+  const ex = { canvas: cv, ctx: cx, recorder, chunks: [], mimeType, ext,
+               reqFrame, lastCapMs: -1e9, finishing: false, scenes, title,
+               returnTo: returnTo || "stage", isRetry: !!isRetry };
   exporter = ex;
   recorder.ondataavailable = (e) => { if (e.data.size) ex.chunks.push(e.data); };
   recorder.onstop = () => deliverExport(ex);
@@ -3162,21 +3491,18 @@ function startExport(t, returnTo, isRetry) {
   // Drive the shared playback machinery with the export flag set.
   stopMusic();               // a live cue doesn't bleed into the file
   mode = "export";
-  play.take = t;
   play.returnTo = ex.returnTo;
+  play.title = title || "";
   play.active = true;
   play.exporting = true;
-  play.musicOuts = dest ? [dest] : null;   // music cues mix into the file, silently
-  play.audio = audioEl;
-  seekPlayback(0);
-  play.playing = true;
+  play.dest = dest;          // narration + music mix into the file, silently
   play.ended = false;
-  if (audioEl) audioEl.play().catch(() => { play.audio = null; });
-  recorder.start(1000);
+  play.playing = true;
+  buildQueue(scenes);
+  gotoScene(0, 0, false);
+  recorder.start(250);   // short timeslice: a very short show still emits data
   // Worker metronome: keeps the export loop stepping at full speed even when
   // the tab is backgrounded (page timers get throttled to 1Hz; workers don't).
-  // When rAF is running normally the metronome sees fresh ticks and stays out
-  // of the way.
   ex.ticker = makeTicker(() => {
     if (exporter !== ex) return;
     const now = performance.now();
@@ -3196,12 +3522,16 @@ function captureExportFrame(force) {
   if (exporter.reqFrame) exporter.reqFrame();
 }
 
+/* Ask the encoder to flush, then stop. Very short shows used to come back
+   with no chunks at all because stop() landed before the encoder had emitted
+   anything; requestData plus a longer settle makes a one-second gag export. */
 function finishExport() {
   if (!exporter || exporter.finishing) return;
   exporter.finishing = true;
   captureExportFrame(true);              // make sure the last frame lands
   const ex = exporter;
-  setTimeout(() => { if (ex.recorder.state !== "inactive") ex.recorder.stop(); }, 150);
+  try { if (ex.recorder.state === "recording") ex.recorder.requestData(); } catch (e) {}
+  setTimeout(() => { if (ex.recorder.state !== "inactive") ex.recorder.stop(); }, 400);
 }
 
 function cancelExport() {
@@ -3214,16 +3544,18 @@ function deliverExport(ex) {
   if (ex && ex.ticker) ex.ticker.stop();
   if (exporter === ex) exporter = null;
   stopMusic();
+  disposeReplay();
   play.active = false;
   play.exporting = false;
-  play.puppets = [];
-  play.audio = null;
+  play.dest = null;
+  play.state.puppets = []; play.state.props = [];
+  play.state.effects = []; play.state.bubbles = [];
   mode = (ex && ex.returnTo) || "stage";
   if (!ex || ex.canceled) return;
   if (!ex.chunks.length) {
     // The very first canvas encoder in a session can come up empty on some
     // machines; one automatic retry is almost always enough.
-    if (!ex.isRetry) { toast("EXPORT HICCUP - RETRYING..."); startExport(ex.take, ex.returnTo, true); }
+    if (!ex.isRetry) { toast("EXPORT HICCUP - RETRYING..."); startExport(ex.scenes, ex.title, ex.returnTo, true); }
     else toast("EXPORT FAILED - PLEASE TRY AGAIN");
     return;
   }
@@ -3399,19 +3731,26 @@ function refreshShowLib(then) {
 }
 
 function saveCurrentShow() {
-  if (!take || take.saved) return;
+  const scenes = recordedScenes();
+  if (!scenes.length) { toast("NOTHING RECORDED YET"); return; }
+  if (show.saved) return;
   const d = new Date();
+  // only the layers you kept are stored: a muted layer is not in the show
   const rec = {
     name: "",   // filled below once the id is known
-    title: take.title || "",
-    trackData: take.trackData || null,
+    title: show.title || "",
     date: (d.getMonth() + 1) + "/" + d.getDate(),
-    duration: take.duration,
-    events: take.events,
-    amps: take.amps,
-    audioBlob: take.audioBlob
+    duration: showDur(),
+    scenes: scenes.map(sc => ({
+      name: sc.name,
+      backdrop: sc.backdrop || 0,
+      layers: sceneLayers(sc).map(L => ({
+        name: L.name, cast: L.cast, duration: L.duration,
+        events: L.events, amps: L.amps, audioBlob: L.audioBlob || null
+      }))
+    }))
   };
-  take.saved = true;
+  show.saved = true;
   if (showStore.db) {
     try {
       const store = showStore.db.transaction("shows", "readwrite").objectStore("shows");
@@ -3424,7 +3763,7 @@ function saveCurrentShow() {
         refreshShowLib();
         toast("SAVED TO LIBRARY AS " + rec.name);
       };
-      rq.onerror = () => { take.saved = false; toast("COULD NOT SAVE SHOW"); };
+      rq.onerror = () => { show.saved = false; toast("COULD NOT SAVE SHOW"); };
       return;
     } catch (e) { /* fall through to memory */ }
   }
@@ -3447,23 +3786,37 @@ function deleteShowFromLib(id) {
   refreshShowLib();
 }
 
-/* Build a playable take from a stored record (cached per record per session
-   so object URLs aren't recreated on every press). */
-function takeFromRecord(rec) {
-  if (rec._take) return rec._take;
-  rec._take = {
-    duration: rec.duration,
-    title: rec.title || "",
-    trackData: rec.trackData || null,
-    events: rec.events,
-    amps: rec.amps,
-    audioBlob: rec.audioBlob || null,
-    audioURL: rec.audioBlob ? URL.createObjectURL(rec.audioBlob) : null,
-    keyframes: buildKeyframes(rec.events),
-    saved: true
-  };
-  return rec._take;
+/* Build playable scenes from a stored record (cached per record per session
+   so object URLs aren't recreated on every press). Records saved before
+   scenes and layers existed hold one flat take: it loads as scene 1, layer 1,
+   so every old show in the library still plays and still exports. */
+function scenesFromRecord(rec) {
+  if (rec._scenes) return rec._scenes;
+  const mkLayer = (name, cast, duration, events, amps, blob) => ({
+    id: nextLayerId++, name, cast: cast || "STAGE", duration,
+    events, amps: amps || [],
+    audioBlob: blob || null,
+    audioURL: blob ? URL.createObjectURL(blob) : null,
+    keyframes: buildKeyframes(events), muted: false
+  });
+  if (rec.scenes) {
+    rec._scenes = rec.scenes.map(sc => ({
+      name: sc.name, backdrop: sc.backdrop || 0,
+      layers: sc.layers.map((L, i) =>
+        mkLayer(L.name || ("L" + (i + 1)), L.cast, L.duration, L.events, L.amps, L.audioBlob))
+    }));
+  } else {
+    const evs = (rec.events || []).slice();
+    if (rec.trackData && !evs.some(e => e.type === "music"))
+      evs.unshift({ t: 0, type: "music", trackData: rec.trackData });
+    rec._scenes = [{
+      name: "SCENE 1", backdrop: 0,
+      layers: [mkLayer("L1", "STAGE", rec.duration, evs, rec.amps, rec.audioBlob)]
+    }];
+  }
+  return rec._scenes;
 }
+function recTitle(rec) { return (rec.title && rec.title.length) ? rec.title : rec.name; }
 /* ============================================================================
    CHARACTER BUILDER — assemble a character from costume slots. Every option
    is recolored by remapping palette indices (see remapFor); the preview is a
@@ -3805,6 +4158,7 @@ function spawnStageProp(propId, x, y) {
   return v;
 }
 function removePuppet(p) {
+  if (p.dubbed) { toast("THAT ONE BELONGS TO AN EARLIER LAYER"); return; }
   if (p.isProp) {
     const d = driverOf(live, p);            // eject a driver before towing
     if (d) unboardVehicle(live, d);
@@ -3841,9 +4195,9 @@ function sceneWipe(nextIdx) {
 function currentSpeaker() {
   for (let i = talkStack.length - 1; i >= 0; i--) {
     const name = talkStack[i];
-    for (const p of live.puppets) if (p.scheme === name) return p;
+    for (const p of live.puppets) if (!p.dubbed && p.scheme === name) return p;
   }
-  if (dragging) return dragging.p;
+  if (dragging && !dragging.p.dubbed && !dragging.p.isProp) return dragging.p;
   return null;
 }
 
@@ -3864,12 +4218,12 @@ function renderScene(ctx, state, opts) {
     for (const p of sorted) {
       // controller badge (or its mirrored copy on a guest screen); hidden
       // during playback and export
-      const label = p.isProp ? "" : (p.scheme ? SCHEMES[p.scheme].label : (p.netBadge || ""));
+      const label = p.dubbed ? "REC" : (p.isProp ? "" : (p.scheme ? SCHEMES[p.scheme].label : (p.netBadge || "")));
       if (label) {
         const w = textW(label) + 4;
         const bx = p.x - (w >> 1), by = p.bbox.y - 10;
         rect(ctx, bx, by, w, 9, NIGHT);
-        drawText(ctx, label, bx + 2, by + 1, ICE);
+        drawText(ctx, label, bx + 2, by + 1, p.dubbed ? ORANGE : ICE);
       }
     }
     if (selected && (live.puppets.includes(selected) || live.props.includes(selected))) {
@@ -3989,11 +4343,12 @@ function miniPortrait(spec) {
 
 /* ---- Selection panel ---------------------------------------------------- */
 function renderSelectionPanel(ctx) {
-  if (!selected || !(live.puppets.includes(selected) || live.props.includes(selected))) return;
+  if (!selected || selected.dubbed) return;
+  if (!(live.puppets.includes(selected) || live.props.includes(selected))) return;
   const p = selected;
   const isProp = !!p.isProp;
   const x0 = IW - 78, y0 = 16;
-  panel(ctx, x0, y0, 76, isProp ? 56 : 84, NIGHT, SILVER);
+  panel(ctx, x0, y0, 76, isProp ? 56 : 112, NIGHT, SILVER);
   drawTextC(ctx, isProp ? p.def.name : p.spec.name, x0 + 38, y0 + 2, SAND);
   let ry;
   if (!isProp && p.guest) {
@@ -4029,6 +4384,20 @@ function renderSelectionPanel(ctx) {
     uiBtn(x0 + 4, ry, 68, 9, cb);
     ry += 10;
   }
+  if (isProp) return;
+  // pose library: click, or use the hotkeys in the help panel
+  drawText(ctx, "POSE (Q R F G Y)", x0 + 4, ry, SILVER);
+  ry += 8;
+  const cells = POSE_ORDER.concat(["stand"]);
+  cells.forEach((k, i) => {
+    const cx2 = x0 + 4 + (i % 3) * 23, cy2 = ry + Math.floor(i / 3) * 10;
+    const on = p.pose === k;
+    panel(ctx, cx2, cy2, 22, 9, on ? BLUE : DUSK, on ? ICE : SLATE);
+    drawTextC(ctx, k === "stand" ? "STD" : POSES[k].short, cx2 + 11, cy2 + 1, on ? WHITE : SILVER);
+    uiBtn(cx2, cy2, 22, 9, ((kk) => () => {
+      if (kk === "stand") setPose(p, null); else poseAction(p, kk);
+    })(k));
+  });
 }
 
 /* ---- Top bar ------------------------------------------------------------ */
@@ -4051,39 +4420,74 @@ function barRow(ctx, items, y) {
   return x;
 }
 
+/* Two-press guard so NEW SHOW can never wipe an unsaved show by accident. */
+let newShowArmed = 0;
+function confirmNewShow() {
+  if (performance.now() < newShowArmed) { newShowDoc(); toast("NEW SHOW - SCENE 1"); newShowArmed = 0; return; }
+  if (!showHasTakes() || show.saved) { newShowDoc(); toast("NEW SHOW - SCENE 1"); return; }
+  newShowArmed = performance.now() + 4000;
+  toast("PRESS NEW AGAIN TO THROW THIS SHOW AWAY");
+}
+
 function renderTopBar(ctx, speaker) {
   rect(ctx, 0, 0, IW, 14, NIGHT);
+  const sc = curScene();
+  const hasBase = sc.layers.length > 0;
   const row1 = [];
   if (!recording) {
     row1.push(["MENU", () => enterTitle()]);
     row1.push(["BUILD", () => enterBuilder(-1)]);
     row1.push(["MUSIC", () => enterMusicEd()]);
-    row1.push(["REC", () => { requestMic(); startRecording(); toast(mic.ok ? "RECORDING!" : "RECORDING (NO MIC - SILENT TAKE)"); }, RED]);
+    row1.push([hasBase ? "RE-REC" : "REC", () => {
+      requestMic();
+      if (startRecording(false))
+        toast(mic.ok ? "RECORDING " + sc.name : "RECORDING (NO MIC - SILENT TAKE)");
+    }, RED]);
+    if (hasBase) row1.push(["OVERDUB", () => {
+      requestMic();
+      if (startRecording(true)) toast("OVERDUB - PLAY OPPOSITE YOURSELF");
+    }, ORANGE]);
   } else {
-    row1.push(["STOP REC", () => { stopRecording(); toast("TAKE READY - PRESS PLAY"); }, RED]);
-    row1.push(["SCENE+", () => sceneWipe((live.backdrop + 1) % BACKDROPS.length), ICE]);
+    row1.push(["STOP REC", () => {
+      const wasDub = !!recording.overdub;
+      stopRecording();
+      toast(wasDub ? "OVERDUB LAYER ADDED" : "TAKE READY - PRESS PLAY");
+    }, RED]);
+    if (!recording.overdub)
+      row1.push(["SCENE+", () => sceneWipe((live.backdrop + 1) % BACKDROPS.length), ICE]);
   }
   row1.push([ccLabel(), () => toggleSpeech(), speech.status === "ready" && speech.enabled ? LIME : SILVER]);
   row1.push(["?", () => { helpOpen = !helpOpen; }]);
   barRow(ctx, row1, 1);
-  // second row: take controls
-  if (take && !recording) {
-    rect(ctx, 0, 14, IW, 14, NIGHT);
+
+  let barY = 14;
+  // second row: show controls
+  if (showHasTakes() && !recording) {
+    rect(ctx, 0, barY, IW, 14, NIGHT);
+    const one = [curScene()];
     barRow(ctx, [
-      ["PLAY", () => enterPlayback(take, "stage"), LIME],
-      ["EXPORT", () => startExport(take, "stage"), SKY],
+      ["SCENE", () => enterPlayback(sceneDur(sc) > 0 ? one : recordedScenes(), show.title, "stage"), LIME],
+      ["SHOW", () => enterPlayback(recordedScenes(), show.title, "stage"), LIME],
+      ["EXPORT", () => startExport(recordedScenes(), show.title, "stage"), SKY],
       ["TITLE", () => openShowTitle(), SAND],
-      !take.saved ? ["SAVE", () => saveCurrentShow(), SAND] : ["SAVED", () => {}, SLATE],
-      ["DISCARD", () => { discardTake(); toast("TAKE DISCARDED"); }]
-    ], 15);
+      show.saved ? ["SAVED", () => {}, SLATE] : ["SAVE", () => saveCurrentShow(), SAND],
+      ["NEW", () => confirmNewShow(), RED]
+    ], barY + 1);
+    barY += 14;
   }
+  renderSceneBar(ctx, barY);
+  barY += 13;
+  renderLayerPanel(ctx, barY);
+
   // status, right-aligned
   if (recording) {
     const secs = Math.floor((performance.now() - recording.t0) / 1000);
-    const label = "REC " + fmtTime(secs * 1000);
+    let label = "REC " + fmtTime(secs * 1000);
+    if (recording.replay)
+      label = "DUB " + fmtTime(secs * 1000) + "/" + fmtTime(recording.replay.duration);
     if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - textW(label) - 14, 4, 6, 6, RED);
-    drawTextR(ctx, label, IW - 4, 4, RED);
-    frameRect(ctx, 0, 0, IW, IH, RED);
+    drawTextR(ctx, label, IW - 4, 4, recording.replay ? ORANGE : RED);
+    frameRect(ctx, 0, 0, IW, IH, recording.replay ? ORANGE : RED);
   } else if (net.hosting) {
     drawTextR(ctx, "ROOM " + net.code + (net.conn ? " - 2P" : " - WAITING"), IW - 4, 4, net.conn ? LIME : ICE);
   } else if (!mic.ok && mic.requested) {
@@ -4091,24 +4495,96 @@ function renderTopBar(ctx, speaker) {
   }
   // current speaker indicator
   if (speaker) {
-    const y = take && !recording ? 30 : 16;
     const label = "TALKING: " + speaker.spec.name;
-    rect(ctx, 2, y, textW(label) + 6, 9, NIGHT);
-    drawText(ctx, label, 5, y + 1, SAND);
+    rect(ctx, 2, barY + 1, textW(label) + 6, 9, NIGHT);
+    drawText(ctx, label, 5, barY + 2, SAND);
+  }
+}
+
+/* ---- Scene tracker ------------------------------------------------------
+   Every scene of the show as a numbered chip. Green = it has been recorded.
+   Pick one and REC/OVERDUB/PLAY all act on that scene alone, so a flubbed
+   scene 2 can be redone without touching scenes 1 and 3.                   */
+function renderSceneBar(ctx, y) {
+  rect(ctx, 0, y, IW, 13, NIGHT);
+  drawText(ctx, "SCENES", 3, y + 3, SILVER);
+  let x = 34;
+  for (let i = 0; i < show.scenes.length && x < 144; i++) {
+    const sc = show.scenes[i];
+    const on = i === show.cur;
+    const has = sc.layers.length > 0;
+    const col = on ? ICE : (has ? LIME : SLATE);
+    panel(ctx, x, y + 1, 12, 11, on ? BLUE : DUSK, col);
+    drawTextC(ctx, String(i + 1), x + 6, y + 3, on ? WHITE : col);
+    uiBtn(x, y + 1, 12, 11, ((k) => () => selectScene(k))(i));
+    x += 13;
+  }
+  if (x >= 144) drawText(ctx, "+", x, y + 3, SILVER);
+  if (recording) {   // left-aligned: the right edge is under the info panel
+    drawText(ctx, recording.overdub ? "OVERDUBBING" : "RECORDING", x + 6, y + 3,
+             recording.overdub ? ORANGE : RED);
+    return;
+  }
+  x = 150;
+  panel(ctx, x, y + 1, 12, 11, DUSK, LIME);
+  drawTextC(ctx, "+", x + 6, y + 3, LIME);
+  uiBtn(x, y + 1, 12, 11, () => addScene());
+  x += 15;
+  panel(ctx, x, y + 1, 26, 11, DUSK, RED);
+  drawTextC(ctx, "DEL", x + 13, y + 3, RED);
+  uiBtn(x, y + 1, 26, 11, () => deleteScene(show.cur));
+  x += 29;
+  const nl = curScene().layers.length;
+  const lbl = (layersOpen ? "HIDE" : "SHOW") + " LAYERS";
+  const w = textW(lbl) + 6;
+  x = Math.max(x, IW - 82 - w);   // stay clear of the selection panel
+  panel(ctx, x, y + 1, w, 11, DUSK, nl ? ICE : SLATE);
+  drawTextC(ctx, lbl, x + w / 2, y + 3, nl ? WHITE : SILVER);
+  uiBtn(x, y + 1, w, 11, () => { layersOpen = !layersOpen; });
+}
+
+/* ---- Layer panel --------------------------------------------------------
+   The passes that make up the selected scene. ON/OFF drops a layer out of
+   playback, saving and export without destroying it; DEL removes it for
+   good. Each row is labelled with the characters that pass performed, so
+   "delete the wizard's overdub" is one click.                              */
+function renderLayerPanel(ctx, y) {
+  const sc = curScene();
+  if (!layersOpen || !sc.layers.length) return;
+  const h = 11 + sc.layers.length * 10;
+  panel(ctx, 2, y, 138, h, NIGHT, SILVER);
+  drawText(ctx, sc.name + " LAYERS", 5, y + 2, SAND);
+  drawTextR(ctx, fmtTime(sceneDur(sc)), 137, y + 2, SILVER);
+  let ry = y + 12;
+  for (let i = 0; i < sc.layers.length; i++) {
+    const L = sc.layers[i];
+    const col = L.muted ? SLATE : WHITE;
+    drawText(ctx, String(i + 1), 5, ry, L.muted ? SLATE : LIME);
+    drawText(ctx, L.cast.slice(0, 11), 12, ry, col);
+    drawText(ctx, L.audioBlob ? "V" : "-", 70, ry, L.muted ? SLATE : ICE);
+    drawText(ctx, fmtTime(L.duration), 78, ry, L.muted ? SLATE : SILVER);
+    if (!recording) {
+      panel(ctx, 98, ry - 1, 18, 9, DUSK, L.muted ? RED : SLATE);
+      drawTextC(ctx, L.muted ? "OFF" : "ON", 107, ry, L.muted ? RED : WHITE);
+      uiBtn(98, ry - 1, 18, 9, ((k) => () => { sc.layers[k].muted = !sc.layers[k].muted; markDirty(); })(i));
+      panel(ctx, 118, ry - 1, 18, 9, DUSK, RED);
+      drawTextC(ctx, "DEL", 127, ry, RED);
+      uiBtn(118, ry - 1, 18, 9, ((k) => () => deleteLayer(sc, k))(i));
+    }
+    ry += 10;
   }
 }
 
 /* ---- show title input ---------------------------------------------------- */
 const showTitle = { active: false, text: "" };
 function openShowTitle() {
-  if (!take) return;
   showTitle.active = true;
-  showTitle.text = take.title || "";
+  showTitle.text = show.title || "";
   textInput = {
     tag: "showtitle", max: 24,
     get: () => showTitle.text,
     set: (v) => { showTitle.text = v; },
-    onEnter: () => { showTitle.active = false; take.title = showTitle.text.trim(); take.saved = false; toast("TITLE SET"); },
+    onEnter: () => { showTitle.active = false; show.title = showTitle.text.trim(); markDirty(); toast("TITLE SET"); },
     onCancel: () => { showTitle.active = false; }
   };
 }
@@ -4123,8 +4599,8 @@ function renderShowTitleInput(ctx) {
 /* ---- curtain + title card (playback and export only) --------------------
    The show starts behind a closing-to-opening theater curtain carrying the
    title card, and the curtain sweeps shut over the final moments.          */
-function drawShowIntro(ctx, t, tk) {
-  const D = tk.duration;
+function drawShowIntro(ctx, t) {
+  const D = play.total;
   const closeF = t > D - 700 ? clamp((t - (D - 700)) / 650, 0, 1) : 0;
   const openF = clamp((t - 500) / 900, 0, 1);
   const cover = Math.max(1 - openF, closeF);        // closed at start and end
@@ -4141,11 +4617,11 @@ function drawShowIntro(ctx, t, tk) {
     rect(ctx, 0, 0, IW, 2, SAND);
   }
   if (t < 1600) {                          // title card
-    const title = (tk.title && tk.title.length) ? tk.title : "A PIXEL PUPPETS SHOW";
+    const title = (play.title && play.title.length) ? play.title : "A PIXEL PUPPETS SHOW";
     drawTextC(ctx, title, IW / 2 + 1, 61, NIGHT, 2);
     drawTextC(ctx, title, IW / 2, 60, SAND, 2);
     drawTextC(ctx, "* PIXEL PUPPETS PRESENTS *", IW / 2, 46, WHITE);
-    if (tk.trackData) drawTextC(ctx, "MUSIC: " + tk.trackData.name, IW / 2, 82, ICE);
+    if (play.musicName) drawTextC(ctx, "MUSIC: " + play.musicName, IW / 2, 82, ICE);
   }
   if (closeF >= 1) drawTextC(ctx, "THE END", IW / 2, 82, SAND, 2);
 }
@@ -4157,18 +4633,18 @@ function fmtTime(ms) {
 
 /* ---- Help overlay ------------------------------------------------------- */
 function renderHelp(ctx) {
-  panel(ctx, 40, 24, 240, 132, NIGHT, ICE);
-  drawTextC(ctx, "HOW TO PLAY", IW / 2, 30, WHITE, 2);
+  panel(ctx, 40, 12, 240, 158, NIGHT, ICE);
+  drawTextC(ctx, "HOW TO PLAY", IW / 2, 18, WHITE, 2);
   const lines = [
     ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE", "Z X C V B"],
     ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE", "I J K L U"]
   ];
-  let y = 52;
+  let y = 38;
   for (const [who, mv, talk, use, ex] of lines) {
     drawText(ctx, who, 48, y, SAND);
     drawText(ctx, mv, 96, y, WHITE);
-    drawText(ctx, talk, 152, y, ICE);
-    drawText(ctx, use, 212, y, LIME);
+    drawText(ctx, talk, 158, y, ICE);
+    drawText(ctx, use, 224, y, LIME);
     drawText(ctx, ex, 48, y + 9, ORANGE);
     drawText(ctx, "= CRY ANGRY HAPPY LAUGH DISGUST", 100, y + 9, SILVER);
     y += 20;
@@ -4179,15 +4655,18 @@ function renderHelp(ctx) {
   drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
   drawText(ctx, "1-8 = CUE MUSIC LIVE, 0 = STOP THE MUSIC", 48, y, SILVER); y += 9;
   drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 9;
-  drawText(ctx, "DEL REMOVES - H CLOSES THIS PANEL", 48, y, SILVER);
-  uiBtn(40, 24, 240, 132, () => { helpOpen = false; });
+  drawText(ctx, "POSES P1 Q R F G Y - P2 O P [ ] ;", 48, y, ORANGE); y += 9;
+  drawText(ctx, "= POINT WAVE CHEER JUMP SIT (AGAIN = STAND)", 48, y, SILVER); y += 9;
+  drawText(ctx, "OVERDUB REPLAYS THE SCENE WHILE YOU ACT A NEW", 48, y, SILVER); y += 9;
+  drawText(ctx, "PUPPET - USE HEADPHONES. DEL REMOVES - H CLOSES", 48, y, SILVER);
+  uiBtn(40, 12, 240, 158, () => { helpOpen = false; });
 }
 
 /* ---- Transport (playback mode) ------------------------------------------ */
 const SCRUB = { x: 76, y: IH - 14, w: IW - 130, h: 10 };
 function renderTransport(ctx) {
   rect(ctx, 0, IH - 18, IW, 18, NIGHT);
-  const t = clamp(playbackClock(), 0, play.take.duration);
+  const t = clamp(playbackClock(), 0, play.total);
   const items = [
     [play.playing ? "PAUSE" : "PLAY", () => { play.playing ? pausePlayback() : resumePlayback(); }],
     ["STOP", () => exitPlayback()]
@@ -4202,22 +4681,24 @@ function renderTransport(ctx) {
   }
   // scrub bar
   panel(ctx, SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, DUSK, SILVER);
-  const fill = Math.floor((SCRUB.w - 2) * (t / play.take.duration));
+  const fill = Math.floor((SCRUB.w - 2) * (t / play.total));
+  // scene boundaries as ticks along the bar, so a multi-scene show reads
+  for (let i = 1; i < play.starts.length; i++)
+    rect(ctx, SCRUB.x + 1 + Math.floor((SCRUB.w - 2) * (play.starts[i] / play.total)), SCRUB.y + 1, 1, SCRUB.h - 2, SLATE);
   rect(ctx, SCRUB.x + 1, SCRUB.y + 1, fill, SCRUB.h - 2, SKY);
   rect(ctx, SCRUB.x + 1 + fill, SCRUB.y + 1, 1, SCRUB.h - 2, WHITE);
   uiBtn(SCRUB.x, SCRUB.y, SCRUB.w, SCRUB.h, (mx) => {
     scrubbing = true;
     scrubTo(mx);
   });
-  drawTextR(ctx, fmtTime(t) + "/" + fmtTime(play.take.duration), IW - 3, IH - 12, WHITE);
-  drawTextC(ctx, "PLAYBACK", IW / 2, 2, ICE);
+  drawTextR(ctx, fmtTime(t) + "/" + fmtTime(play.total), IW - 3, IH - 12, WHITE);
+  drawTextC(ctx, play.queue.length > 1
+    ? "PLAYBACK - SCENE " + (play.qi + 1) + " OF " + play.queue.length
+    : "PLAYBACK", IW / 2, 2, ICE);
 }
 function scrubTo(mx) {
   const f = clamp((mx - SCRUB.x - 1) / (SCRUB.w - 2), 0, 1);
-  const wasPlaying = play.playing;
-  pausePlayback();
-  seekPlayback(Math.round(f * play.take.duration));
-  if (wasPlaying) resumePlayback();
+  seekPlayback(Math.round(f * play.total));
 }
 
 /* ---- Music cue bar -------------------------------------------------------
@@ -4294,7 +4775,7 @@ function renderTitle(ctx) {
   drawTextC(ctx, "PIXEL PUPPETS", IW / 2, 26, SAND, 2);
   drawTextC(ctx, "BUILD PUPPETS. PUT ON A SHOW.", IW / 2, 44, WHITE);
   const items = [
-    ["NEW SHOW", () => { mode = "stage"; }],
+    ["GO TO STAGE", () => { mode = "stage"; }],
     ["PLAY TOGETHER", () => enterNet()],
     ["SHOW LIBRARY (" + showLib.length + ")", () => { refreshShowLib(); mode = "library"; }],
     ["CHARACTER BUILDER", () => enterBuilder(-1)],
@@ -4335,14 +4816,16 @@ function renderLibrary(ctx) {
   for (let i = libScroll; i < Math.min(showLib.length, libScroll + LIB_ROWS); i++) {
     const rec = showLib[i];
     panel(ctx, 10, y, 300, 20, DUSK, SLATE);
-    drawText(ctx, (rec.title && rec.title.length ? rec.title : rec.name).slice(0, 14), 16, y + 6, SAND);
+    drawText(ctx, recTitle(rec).slice(0, 14), 16, y + 6, SAND);
     drawText(ctx, fmtTime(rec.duration), 108, y + 6, WHITE);
     drawText(ctx, rec.date, 134, y + 6, SILVER);
-    drawText(ctx, rec.trackData ? "M" : "", 162, y + 6, LIME);
-    drawText(ctx, rec.audioBlob ? "V" : "", 172, y + 6, ICE);
+    const nsc = rec.scenes ? rec.scenes.length : 1;
+    let nlay = 0;
+    if (rec.scenes) for (const sc of rec.scenes) nlay += sc.layers.length; else nlay = 1;
+    drawText(ctx, nsc + "S/" + nlay + "L", 160, y + 6, nlay > nsc ? LIME : SILVER);
     const btns = [
-      ["PLAY", LIME, () => enterPlayback(takeFromRecord(rec), "library")],
-      ["EXPORT", SKY, () => startExport(takeFromRecord(rec), "library")],
+      ["PLAY", LIME, () => enterPlayback(scenesFromRecord(rec), recTitle(rec), "library")],
+      ["EXPORT", SKY, () => startExport(scenesFromRecord(rec), recTitle(rec), "library")],
       ["DEL", RED, () => { deleteShowFromLib(rec.id); toast("DELETED " + rec.name); }]
     ];
     let bx = 196;
@@ -4852,10 +5335,18 @@ function update(dt) {
   netTick(dt);
 
   if (mode === "stage") {
+    // OVERDUB: the scene's earlier layers replay onto the live stage, locked
+    // to the recording clock so this pass lines up with them exactly.
+    if (recording && recording.replay) {
+      const R = recording.replay;
+      const rt = recNow();
+      R.step(Math.min(rt, R.duration), dt);
+      if (rt >= R.duration) { stopRecording(); toast("OVERDUB LAYER ADDED"); }
+    }
     // keyboard-driven puppets (all schemes work simultaneously); a boarded
     // puppet's controls drive its vehicle instead
     for (const p of live.puppets) {
-      if (!p.scheme) continue;
+      if (p.dubbed || !p.scheme) continue;
       if (p.vehicle) {
         const v = findEntity(live, p.vehicle);
         if (v) driveVehicle(v, SCHEMES[p.scheme]);
@@ -4869,13 +5360,14 @@ function update(dt) {
     }
     // riders follow their vehicles
     for (const p of live.puppets) {
-      if (!p.vehicle) continue;
+      if (p.dubbed || !p.vehicle) continue;
       const v = findEntity(live, p.vehicle);
       if (v) { p.fx = v.fx; p.fy = v.fy; p.facing = v.facing; }
     }
     // props: animation timers, wheel roll when dragged, kicked-ball physics
     updateKineticProps(dt);
     for (const v of live.props) {
+      if (v.dubbed) continue;      // driven by the overdub replay instead
       v.animT += dt;
       if (v.wobbleT > 0) v.wobbleT -= dt;
       const dvx = v.fx - (v._pfx !== undefined ? v._pfx : v.fx);
@@ -4885,11 +5377,17 @@ function update(dt) {
     }
     // walk cycles from actual movement (drag or keys — same path)
     for (const p of live.puppets) {
+      if (p.dubbed) continue;
       const dx = p.fx - (p._pfx !== undefined ? p._pfx : p.fx);
       if (dragging && dragging.p === p) {
         if (dx > 0.3) p.facing = 1; else if (dx < -0.3) p.facing = -1;
       }
       p.animate(dt, p.vehicle ? 0 : dx);
+      // walking out of a held pose is part of the performance: record it
+      if (p.poseCancelled) {
+        p.poseCancelled = false;
+        if (recording) recEvent({ type: "pose", id: p.id, kind: null });
+      }
       p._pfx = p.fx;
     }
     updateEffects(live, dt);
@@ -4898,10 +5396,11 @@ function update(dt) {
     let amp = 0;
     if (speaker) amp = mic.ok ? mic.amp : flapAmp(performance.now());
     const jaw = liveMouth.update(amp, dt);
-    for (const p of live.puppets) p.jaw = (p === speaker) ? jaw : 0;
+    for (const p of live.puppets) { if (!p.dubbed) p.jaw = (p === speaker) ? jaw : 0; }
     if (recording) recordSample(speaker ? speaker.id : -1, amp);
     speechStep(speaker);                       // auto-caption utterances
-    duckMusic(jaw > 0);                        // narration over the theme song
+    // narration over the theme song — either yours or an earlier layer's
+    duckMusic(jaw > 0 || !!(recording && recording.replay && recording.replay.anyJaw));
     if (live.pendingBackdrop && performance.now() >= live.pendingBackdrop.at) {
       setBackdrop(live.pendingBackdrop.idx);   // lands mid-wipe
       live.pendingBackdrop = null;
@@ -4949,20 +5448,20 @@ function render(frameDt) {
     renderToast(sctx);
     if (helpOpen) renderHelp(sctx);
   } else if (mode === "playback") {
-    renderScene(sctx, play, { clean: true, time: playbackClock() });
-    drawShowIntro(sctx, playbackClock(), play.take);
+    renderScene(sctx, play.state, { clean: true, time: playbackClock() });
+    drawShowIntro(sctx, playbackClock());
     renderTransport(sctx);
   } else if (mode === "export") {
-    renderScene(sctx, play, { clean: true, time: playbackClock() });
-    drawShowIntro(sctx, playbackClock(), play.take);   // curtain IS in the video
+    renderScene(sctx, play.state, { clean: true, time: playbackClock() });
+    drawShowIntro(sctx, playbackClock());       // curtain IS in the video
     captureExportFrame();                       // export gets the clean frame
     // progress overlay only on the visible screen, never in the file
-    const t = clamp(playbackClock(), 0, play.take.duration);
-    const pct = Math.floor(100 * t / play.take.duration);
+    const t = clamp(playbackClock(), 0, play.total);
+    const pct = Math.floor(100 * t / play.total);
     panel(sctx, 80, 80, 160, 30, NIGHT, ICE);
     drawTextC(sctx, "EXPORTING " + pct + "%", IW / 2, 84, WHITE);
     rect(sctx, 90, 96, 140, 8, DUSK);
-    rect(sctx, 90, 96, Math.floor(140 * t / play.take.duration), 8, SKY);
+    rect(sctx, 90, 96, Math.floor(140 * t / play.total), 8, SKY);
     panel(sctx, 136, 114, 48, 12, DUSK, SLATE);
     drawTextC(sctx, "CANCEL", IW / 2, 117, WHITE);
     uiBtn(136, 114, 48, 12, () => cancelExport());
@@ -4991,6 +5490,7 @@ function onMouseDown(x, y) {
   const sorted = sortStage([...live.puppets, ...live.props]);
   for (let i = sorted.length - 1; i >= 0; i--) {
     const p = sorted[i], b = p.bbox;
+    if (p.dubbed) continue;          // an earlier layer's puppet: not yours
     if (!p.isProp && p.vehicle) continue;
     if (b && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
       selected = p;
@@ -5064,6 +5564,17 @@ function onKeyPressed(code) {
       if (!target && name === "WASD" && selected && !selected.isProp && live.puppets.includes(selected))
         target = selected;
       if (target) exprAction(target, kind);
+    }
+    // pose hotkeys, per player (same fallback as expressions: P1's keys
+    // drive the selected puppet when nobody holds the WASD controller)
+    for (const name of SCHEME_NAMES) {
+      const pk = POSE_KEYS[name] && POSE_KEYS[name][code];
+      if (!pk) continue;
+      let target = null;
+      for (const p of live.puppets) if (!p.dubbed && p.scheme === name) target = p;
+      if (!target && name === "WASD" && selected && !selected.isProp && live.puppets.includes(selected))
+        target = selected;
+      if (target) poseAction(target, pk);
     }
     // music cue hotkeys: 1-8 start a track (same again stops), 0 stops
     if (code === "Digit0") cueMusic(null);
