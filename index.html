@@ -2083,7 +2083,12 @@ function updateKineticProps(dt) {
 const mic = {
   requested: false,
   ok: false,
-  stream: null,       // raw mic MediaStream (also fed to MediaRecorder)
+  stream: null,       // raw mic MediaStream (drives the analyser + captions)
+  gate: null,         // GainNode: open only while a talk key is held
+  recDest: null,      // MediaStreamDestination fed through the gate
+  recStream: null,    // what a take actually records (gated, not raw)
+  gateOpen: false,
+  gateUntil: 0,       // gate stays open this long after the key is let go
   analyser: null,
   buf: null,
   amp: 0,             // smoothed RMS, 0..~1
@@ -2109,6 +2114,20 @@ function requestMic() {
       mic.analyser.fftSize = 512;
       mic.buf = new Float32Array(mic.analyser.fftSize);
       src.connect(mic.analyser);
+      // ---- gated recording path ------------------------------------------
+      // A take records THIS stream, not the raw mic: the gain node is closed
+      // unless a talk key is held, so the room between lines - the shuffling,
+      // the "what do I say next", the dog - never reaches the show. The
+      // analyser above stays on the raw mic, so the mouth still reacts live
+      // and Whisper captions still hear everything they are given.
+      mic.gate = ctx.createGain();
+      mic.gate.gain.value = 0;
+      mic.recDest = ctx.createMediaStreamDestination();
+      src.connect(mic.gate);
+      mic.gate.connect(mic.recDest);
+      mic.recStream = mic.recDest.stream;
+      mic.gateOpen = false;
+      mic.gateUntil = 0;
       mic.ok = true;
     })
     .catch(() => { mic.ok = false; });
@@ -2121,6 +2140,25 @@ function updateMicAmp() {
   for (let i = 0; i < mic.buf.length; i++) sum += mic.buf[i] * mic.buf[i];
   const rms = Math.sqrt(sum / mic.buf.length);
   mic.amp = mic.amp * 0.6 + rms * 0.4;   // smoothing
+}
+
+/* Open the mic gate while any talk key is held - either player's, or a
+   remote guest's (they all live in talkStack). A short tail keeps the gate
+   open past the key release so letting go a beat early doesn't clip the last
+   syllable, and both edges are ramped so the track has no clicks in it. */
+const MIC_TAIL_MS = 220;
+function updateMicGate() {
+  if (!mic.ok || !mic.gate || !mic.ctx) return;
+  const now = performance.now();
+  if (talkStack.length) mic.gateUntil = now + MIC_TAIL_MS;
+  const open = talkStack.length > 0 || now < mic.gateUntil;
+  if (open === mic.gateOpen) return;
+  mic.gateOpen = open;
+  const g = mic.gate.gain, t = mic.ctx.currentTime;
+  g.cancelScheduledValues(t);
+  g.setValueAtTime(g.value, t);
+  // open fast so the first syllable lands; close gently so it doesn't click
+  g.linearRampToValueAtTime(open ? 1 : 0, t + (open ? 0.012 : 0.08));
 }
 
 /* Quantizer shared by live performance, playback and export so the mouth
@@ -2961,10 +2999,11 @@ function startRecording(overdub) {
     if (!p.dubbed && p.vehicle) recording.events.push({ t: 0, type: "board", id: p.id, vid: p.vehicle });
   recording.events.push({ t: 0, type: "speaker", id: -1 });
   recording.lastSpeaker = -1;
-  if (mic.ok && mic.stream && window.MediaRecorder) {
+  if (mic.ok && (mic.recStream || mic.stream) && window.MediaRecorder) {
     try {
+      audioCtx();              // a suspended context would record pure silence
       const rec = recording;   // handler closes over the pass, not the global
-      rec.mediaRec = new MediaRecorder(mic.stream);
+      rec.mediaRec = new MediaRecorder(mic.recStream || mic.stream);
       rec.mediaRec.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
       rec.mediaRec.start();
     } catch (err) { recording.mediaRec = null; }
@@ -4682,6 +4721,11 @@ function renderTopBar(ctx, speaker) {
       label = "DUB " + fmtTime(secs * 1000) + "/" + fmtTime(recording.replay.duration);
     if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - textW(label) - 14, 4, 6, 6, RED);
     drawTextR(ctx, label, IW - 4, 4, recording.replay ? ORANGE : RED);
+    // the mic only reaches the take while a talk key is down: say so plainly
+    if (mic.ok) {
+      const ml = mic.gateOpen ? "MIC LIVE" : "HOLD TALK";
+      drawTextR(ctx, ml, IW - textW(label) - 24, 4, mic.gateOpen ? LIME : SLATE);
+    }
     frameRect(ctx, 0, 0, IW, IH, recording.replay ? ORANGE : RED);
   } else if (net.hosting) {
     drawTextR(ctx, "ROOM " + net.code + (net.conn ? " - 2P" : " - WAITING"), IW - 4, 4, net.conn ? LIME : ICE);
@@ -4828,13 +4872,13 @@ function fmtTime(ms) {
 
 /* ---- Help overlay ------------------------------------------------------- */
 function renderHelp(ctx) {
-  panel(ctx, 40, 8, 240, 166, NIGHT, ICE);
-  drawTextC(ctx, "HOW TO PLAY", IW / 2, 14, WHITE, 2);
+  panel(ctx, 40, 4, 240, 174, NIGHT, ICE);
+  drawTextC(ctx, "HOW TO PLAY", IW / 2, 9, WHITE, 2);
   const lines = [
     ["PLAYER 1", "WASD MOVE", "L-SHIFT TALK", "E USE", "Z X C V B"],
     ["PLAYER 2", "ARROWS MOVE", "R-SHIFT TALK", "ENTER USE", "I J K L U"]
   ];
-  let y = 34;
+  let y = 29;
   for (const [who, mv, talk, use, ex] of lines) {
     drawText(ctx, who, 48, y, SAND);
     drawText(ctx, mv, 96, y, WHITE);
@@ -4849,13 +4893,14 @@ function renderHelp(ctx) {
   drawText(ctx, "SPACE = USE FOR THE SELECTED PUPPET", 48, y, SILVER); y += 9;
   drawText(ctx, "T = TYPE A SPEECH BUBBLE - CC = AUTO CAPTIONS", 48, y, SILVER); y += 9;
   drawText(ctx, "1-8 = CUE MUSIC LIVE, 0 = STOP THE MUSIC", 48, y, SILVER); y += 9;
-  drawText(ctx, "HOLD A TALK KEY AND SPEAK INTO THE MIC", 48, y, SILVER); y += 9;
+  drawText(ctx, "HOLD A TALK KEY AND SPEAK - THE MIC ONLY", 48, y, SILVER); y += 9;
+  drawText(ctx, "RECORDS WHILE A TALK KEY IS HELD DOWN", 48, y, SILVER); y += 9;
   drawText(ctx, "DRAWER SHOWS 6 FAVORITES - ALL = WHOLE ROSTER", 48, y, SILVER); y += 9;
   drawText(ctx, "POSES P1 Q R F G Y - P2 O P [ ] ;", 48, y, ORANGE); y += 9;
   drawText(ctx, "= POINT WAVE CHEER JUMP SIT (AGAIN = STAND)", 48, y, SILVER); y += 9;
   drawText(ctx, "OVERDUB REPLAYS THE SCENE WHILE YOU ACT A NEW", 48, y, SILVER); y += 9;
   drawText(ctx, "PUPPET - USE HEADPHONES. DEL REMOVES - H CLOSES", 48, y, SILVER);
-  uiBtn(40, 8, 240, 166, () => { helpOpen = false; });
+  uiBtn(40, 4, 240, 174, () => { helpOpen = false; });
 }
 
 /* ---- Transport (playback mode) ------------------------------------------ */
@@ -5528,6 +5573,7 @@ let mode = "stage";   // "stage" | "builder" | "playback" | "export"
 /* ---- one fixed step ----------------------------------------------------- */
 function update(dt) {
   updateMicAmp();
+  updateMicGate();
   netTick(dt);
 
   if (mode === "stage") {
