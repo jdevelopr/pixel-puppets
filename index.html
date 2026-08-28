@@ -1364,24 +1364,268 @@ function paintGraveyard(c) {
   }
 }
 
+/* ============================================================================
+   FOREGROUND LAYERS — scenery drawn IN FRONT of the puppets, so the stage has
+   a near plane as well as a far one and characters can pass behind things.
+
+   Two rules keep them from getting in the way of the show:
+     - they live at the LEFT and RIGHT edges and along the top, never across
+       the middle, so the whole performing band stays clear;
+     - they are painted darker and higher-contrast than the backdrop, which is
+       what sells them as close to the camera.
+   Each one paints onto its own transparent canvas, baked once at load like
+   the backdrops. Speech bubbles, controller badges and the selection outline
+   are all drawn after the foreground, so nothing you need to read or grab can
+   ever be hidden behind it.
+   ==========================================================================*/
+
+/* Heavy stone piers, much darker than the wall behind them. */
+function fgCastle(c) {
+  const r = RNG(101);
+  for (const [x0, inner] of [[0, 30], [IW - 32, -1]]) {
+    const w = 32;
+    rect(c, x0, 0, w, IH, DUSK);
+    for (let y = 0; y < IH; y += 14) {
+      rect(c, x0, y, w, 1, NIGHT);
+      rect(c, x0 + (((y / 14) % 2) ? 10 : 22), y, 1, 14, NIGHT);
+    }
+    for (let i = 0; i < 40; i++)
+      rect(c, x0 + Math.floor(r() * w), Math.floor(r() * IH), 2, 1, r() < 0.5 ? SLATE : NIGHT);
+    rect(c, inner > 0 ? x0 + w - 3 : x0, 0, 3, IH, NIGHT);      // shadowed inner edge
+    rect(c, inner > 0 ? x0 : x0 + w - 2, 0, 2, IH, SLATE);      // lit outer edge
+    for (let i = 0; i < 40; i++)                                 // damp base
+      px(c, x0 + Math.floor(r() * w), IH - Math.floor(r() * r() * 40), r() < 0.6 ? MOSS : OLIVE);
+  }
+  // arch springing across the top
+  rect(c, 0, 0, IW, 9, DUSK);
+  rect(c, 0, 9, IW, 1, NIGHT);
+  for (let x = 0; x < IW; x += 16) rect(c, x, 0, 1, 9, NIGHT);
+  for (const [x0, dir] of [[32, 1], [IW - 44, -1]])
+    for (let i = 0; i < 12; i++)
+      rect(c, x0 + (dir > 0 ? i : 12 - i), 9 + i, dir > 0 ? 12 - i : i + 1, 1, DUSK);
+}
+
+/* Two close trunks and a leaf canopy hanging into the top corners. */
+function fgForest(c) {
+  const r = RNG(202);
+  for (const [x0, lit] of [[0, 1], [IW - 26, -1]]) {
+    const w = 26;
+    rect(c, x0, 0, w, IH, COCOA);
+    rect(c, lit > 0 ? x0 : x0 + w - 4, 0, 4, IH, BROWN);
+    rect(c, lit > 0 ? x0 + w - 5 : x0, 0, 5, IH, NIGHT);
+    for (let i = 0; i < 60; i++) {                       // bark grain
+      const bx = x0 + 2 + Math.floor(r() * (w - 6)), by = Math.floor(r() * IH);
+      rect(c, bx, by, 1, 2 + Math.floor(r() * 4), r() < 0.5 ? NIGHT : BROWN);
+    }
+    for (let i = 0; i < 26; i++)                          // moss on the north side
+      px(c, x0 + Math.floor(r() * w), IH - Math.floor(r() * r() * 60), MOSS);
+  }
+  // Canopy overhanging the top corners. Leaf density and droop both fall off
+  // with distance from the corner, so the mass stays attached to the band at
+  // the top instead of scattering loose blobs across open sky.
+  for (const [cx, dir] of [[0, 1], [IW, -1]]) {
+    rect(c, dir > 0 ? 0 : IW - 76, 0, 76, 10, MOSS);
+    for (let i = 0; i < 90; i++) {
+      const t = r();                                  // 0 at the corner, 1 far in
+      const lx = cx + dir * Math.floor(t * t * 94);
+      const ly = Math.floor(r() * (28 - t * 22));
+      rect(c, lx, ly, 5 + Math.floor(r() * 6), 4 + Math.floor(r() * 4),
+           r() < 0.5 ? MOSS : GREEN);
+    }
+  }
+  // ferns at the base of each trunk
+  for (const bx of [24, IW - 26]) {
+    for (let i = 0; i < 9; i++) {
+      const fx = bx + Math.floor(r() * 16) - 8, fh = 8 + Math.floor(r() * 10);
+      rect(c, fx, IH - fh, 1, fh, r() < 0.5 ? MOSS : GREEN);
+      px(c, fx, IH - fh, LIME);
+    }
+  }
+}
+
+/* Bulkhead ribs and a pipe run: the inside of a hull, close to camera. */
+function fgSpaceship(c) {
+  const r = RNG(303);
+  for (const [x0, dir] of [[0, 1], [IW - 30, -1]]) {
+    const w = 30;
+    rect(c, x0, 0, w, IH, DUSK);
+    rect(c, dir > 0 ? x0 + w - 4 : x0, 0, 4, IH, NIGHT);
+    rect(c, dir > 0 ? x0 : x0 + w - 3, 0, 3, IH, SLATE);
+    for (let y = 6; y < IH; y += 22) {                    // rib plates
+      rect(c, x0, y, w, 8, SLATE);
+      rect(c, x0, y, w, 1, SILVER);
+      rect(c, x0, y + 7, w, 1, NIGHT);
+      for (let i = 0; i < 3; i++) px(c, x0 + 5 + i * 9, y + 3, NIGHT);   // rivets
+    }
+    rect(c, dir > 0 ? x0 + 6 : x0 + w - 10, 40, 4, IH - 40, TEAL);       // conduit
+    for (let y = 44; y < IH; y += 16) px(c, dir > 0 ? x0 + 7 : x0 + w - 9, y, AQUA);
+  }
+  // pipe run across the top
+  rect(c, 0, 0, IW, 12, DUSK);
+  rect(c, 0, 12, IW, 1, NIGHT);
+  rect(c, 0, 4, IW, 3, SLATE);
+  rect(c, 0, 4, IW, 1, SILVER);
+  for (let x = 8; x < IW; x += 26) { rect(c, x, 2, 3, 8, SLATE); px(c, x + 1, 3, NIGHT); }
+  for (let i = 0; i < 10; i++) px(c, Math.floor(r() * IW), 8, AQUA);
+}
+
+/* Classroom: dark wall returns, and paper bunting strung across the top. */
+function fgSchool(c) {
+  const r = RNG(404);
+  for (const [x0, dir] of [[0, 1], [IW - 26, -1]]) {
+    const w = 26;
+    rect(c, x0, 0, w, IH, COCOA);
+    rect(c, dir > 0 ? x0 + w - 4 : x0, 0, 4, IH, NIGHT);
+    rect(c, dir > 0 ? x0 : x0 + w - 3, 0, 3, IH, BROWN);
+    rect(c, x0, 96, w, 2, NIGHT);
+    for (let y = 8; y < IH; y += 34) {                    // panelling
+      rect(c, x0 + 4, y, w - 10, 26, BROWN);
+      rect(c, x0 + 4, y, w - 10, 1, TAN);
+    }
+  }
+  // bunting: a string of triangles along the top
+  rect(c, 26, 6, IW - 52, 1, COCOA);
+  const FLAGS = [RED, GOLD, AQUA, MAGENTA, LIME, VIOLET, ORANGE, MINT];
+  for (let x = 30, k = 0; x < IW - 30; x += 22, k++) {
+    const col = FLAGS[k % FLAGS.length];
+    for (let i = 0; i < 10; i++) rect(c, x + i, 7 + i, 20 - i * 2, 1, col);
+    rect(c, x, 7, 20, 1, NIGHT);
+  }
+}
+
+/* Palm fronds hanging into both top corners, over dune grass at the edges. */
+function fgBeach(c) {
+  const r = RNG(505);
+  for (const [ox, dir] of [[6, 1], [IW - 6, -1]]) {
+    rect(c, dir > 0 ? 0 : IW - 12, 0, 12, 34, BROWN);     // frond stem coming in
+    for (const [dy, len] of [[6, 60], [14, 74], [24, 56], [34, 40]]) {
+      for (let i = 0; i < len; i++) {
+        const fx = ox + dir * i, fy = dy + Math.floor(i * i / 90);
+        rect(c, fx, fy, 1, 5 - Math.floor(i / 22), i > len - 12 ? MOSS : GREEN);
+        if (i % 7 === 0) px(c, fx, fy - 1, LIME);
+        if (i % 5 === 0) px(c, fx, fy + 4, MOSS);
+      }
+    }
+  }
+  // dune grass along both edges
+  for (const [x0, w] of [[0, 26], [IW - 26, 26]]) {
+    for (let i = 0; i < 34; i++) {
+      const gx = x0 + Math.floor(r() * w), gh = 14 + Math.floor(r() * 24);
+      const lean = r() < 0.5 ? 1 : -1;
+      for (let k = 0; k < gh; k++)
+        px(c, gx + Math.floor(k / 7) * lean, IH - k, k > gh - 5 ? LIME : (r() < 0.4 ? MOSS : GREEN));
+    }
+  }
+}
+
+/* Near buildings in silhouette, and a traffic light on the left kerb. */
+function fgCity(c) {
+  const r = RNG(606);
+  for (const [x0, dir] of [[0, 1], [IW - 34, -1]]) {
+    const w = 34;
+    rect(c, x0, 0, w, IH, NIGHT);
+    rect(c, dir > 0 ? x0 + w - 2 : x0, 0, 2, IH, DUSK);
+    for (let y = 10; y < IH - 20; y += 20)                 // a few lit windows
+      for (let x = x0 + 5; x < x0 + w - 7; x += 12)
+        if (r() < 0.5) {
+          rect(c, x, y, 6, 8, r() < 0.75 ? GOLD : AQUA);
+          rect(c, x, y, 6, 1, CREAM);
+        }
+    rect(c, x0, 0, w, 4, DUSK);
+    for (let i = 0; i < 14; i++) px(c, x0 + Math.floor(r() * w), Math.floor(r() * IH), DUSK);
+  }
+  // Signal hung off the near building on a bracket. Deliberately NOT on a
+  // floor-standing pole: a pole here would run straight down through the face
+  // of anyone standing at the left edge of the stage.
+  rect(c, 34, 20, 16, 3, NIGHT);
+  rect(c, 46, 22, 3, 8, NIGHT);
+  rect(c, 42, 28, 11, 26, NIGHT);
+  rect(c, 44, 31, 7, 6, RED);
+  rect(c, 44, 39, 7, 6, DUSK);
+  rect(c, 44, 47, 7, 6, DUSK);
+  // overhead cables
+  for (const y of [16, 22]) for (let x = 34; x < IW - 34; x += 2) px(c, x, y + Math.floor(Math.sin(x / 40) * 2), NIGHT);
+}
+
+/* The proscenium itself: curtain legs and valance, in front of the cast. */
+function fgTheater(c) {
+  for (const [x0, dir] of [[0, 1], [IW - 34, -1]]) {
+    rect(c, x0, 0, 34, IH, RED);
+    for (let i = 4; i < 34; i += 7) rect(c, x0 + (dir > 0 ? i : 34 - i - 3), 0, 3, IH, WINE);
+    rect(c, dir > 0 ? x0 + 31 : x0, 0, 3, IH, NIGHT);       // edge in shadow
+    rect(c, dir > 0 ? x0 : x0 + 32, 0, 2, IH, ORANGE);      // edge catching the light
+    rect(c, x0 + (dir > 0 ? 20 : 2), 74, 12, 9, GOLD);      // tieback
+    rect(c, x0 + (dir > 0 ? 20 : 2), 74, 12, 2, CREAM);
+    for (let y = 84; y < 104; y += 4) rect(c, x0 + (dir > 0 ? 16 : 6), y, 12, 2, WINE);
+  }
+  // valance
+  rect(c, 0, 0, IW, 14, RED);
+  rect(c, 0, 0, IW, 2, GOLD);
+  rect(c, 0, 12, IW, 2, WINE);
+  for (let x = 0; x < IW; x += 18) {
+    for (let i = 0; i < 6; i++) rect(c, x + 3 + i, 14 + i, 12 - i * 2, 1, RED);
+    rect(c, x + 8, 20, 2, 2, GOLD);
+  }
+}
+
+/* Foreground headstones and bare branches reaching in from the top. */
+function fgGraveyard(c) {
+  const r = RNG(707);
+  // a leaning crypt on the left, a big headstone on the right
+  rect(c, 0, 96, 30, IH - 96, NIGHT);
+  rect(c, 2, 84, 26, 14, NIGHT);
+  rect(c, 4, 78, 22, 8, NIGHT);
+  rect(c, 3, 86, 8, 1, DUSK); rect(c, 3, 92, 12, 1, DUSK);
+  rect(c, IW - 26, 88, 26, IH - 88, NIGHT);
+  rect(c, IW - 22, 78, 18, 12, NIGHT);
+  rect(c, IW - 19, 82, 4, 1, DUSK); rect(c, IW - 21, 96, 10, 1, DUSK);
+  for (let i = 0; i < 40; i++) {                            // moss and weeds
+    px(c, Math.floor(r() * 30), 100 + Math.floor(r() * 76), r() < 0.5 ? MOSS : OLIVE);
+    px(c, IW - 26 + Math.floor(r() * 26), 100 + Math.floor(r() * 76), r() < 0.5 ? MOSS : OLIVE);
+  }
+  // bare branches reaching in from both top corners
+  for (const [ox, dir] of [[0, 1], [IW, -1]]) {
+    for (const [y0, len, drop] of [[6, 92, 26], [20, 66, 34], [2, 50, 14]]) {
+      for (let i = 0; i < len; i++) {
+        const bx = ox + dir * i, by = y0 + Math.floor((i * i) / (len * 92 / drop));
+        rect(c, bx, by, 1, 3, NIGHT);
+        if (i % 17 === 0 && i > 10) for (let k = 0; k < 9; k++) px(c, bx + dir * Math.floor(k / 3), by + k, NIGHT);
+      }
+    }
+  }
+}
+
 const BACKDROPS = [
-  { id: "castle", name: "CASTLE", paint: paintCastle },
-  { id: "forest", name: "FOREST", paint: paintForest },
-  { id: "ship",   name: "SPACESHIP", paint: paintSpaceship },
-  { id: "school", name: "SCHOOL", paint: paintSchool },
-  { id: "beach",  name: "BEACH", paint: paintBeach },
-  { id: "city",   name: "CITY", paint: paintCity },
-  { id: "theater", name: "THEATER", paint: paintTheater },
-  { id: "grave",  name: "GRAVEYARD", paint: paintGraveyard }
+  { id: "castle", name: "CASTLE", paint: paintCastle, fg: fgCastle },
+  { id: "forest", name: "FOREST", paint: paintForest, fg: fgForest },
+  { id: "ship",   name: "SPACESHIP", paint: paintSpaceship, fg: fgSpaceship },
+  { id: "school", name: "SCHOOL", paint: paintSchool, fg: fgSchool },
+  { id: "beach",  name: "BEACH", paint: paintBeach, fg: fgBeach },
+  { id: "city",   name: "CITY", paint: paintCity, fg: fgCity },
+  { id: "theater", name: "THEATER", paint: paintTheater, fg: fgTheater },
+  { id: "grave",  name: "GRAVEYARD", paint: paintGraveyard, fg: fgGraveyard }
 ];
 for (const b of BACKDROPS) {
   const [cv, cx] = makeCanvas(IW, IH);
   b.paint(cx);
   b.canvas = cv;
+  if (b.fg) {                      // the near plane, on its own transparent sheet
+    const [fv, fx] = makeCanvas(IW, IH);
+    b.fg(fx);
+    b.fgCanvas = fv;
+  }
+  // one flattened copy for the drawer thumbnails, so a scene previews whole
+  const [tv, tx] = makeCanvas(IW, IH);
+  tx.drawImage(cv, 0, 0);
+  if (b.fgCanvas) tx.drawImage(b.fgCanvas, 0, 0);
+  b.thumb = tv;
 }
 
-/* Stage bounds for puppet feet. */
-const STAGE_MINX = 10, STAGE_MAXX = IW - 10;
+/* Stage bounds for puppet feet. Held clear of the foreground edge pieces
+   (34px at their widest) so a puppet can walk BEHIND one without ever
+   disappearing into it completely. */
+const FG_EDGE = 34;
+const STAGE_MINX = FG_EDGE + 2, STAGE_MAXX = IW - FG_EDGE - 2;
 const STAGE_MINY = 100, STAGE_MAXY = IH - 6;
 /* ============================================================================
    WEATHER FX — procedural particle overlays (rain, snow, fireflies) drawn
@@ -4633,6 +4877,10 @@ function renderScene(ctx, state, opts) {
     else if (!p.vehicle) drawPuppet(ctx, p, opts);   // drivers drawn by vehicle
   }
   if (state.effects) drawEffects(ctx, state);
+  // the near plane: puppets can walk behind it, weather falls in front of it,
+  // and bubbles/badges below are drawn later so they are never hidden
+  const fgc = BACKDROPS[state.backdrop].fgCanvas;
+  if (fgc) ctx.drawImage(fgc, 0, 0);
   const now = opts.time !== undefined ? opts.time : performance.now();
   drawWeather(ctx, state.weather, now);
   drawBubbles(ctx, state, now);
@@ -4749,7 +4997,7 @@ function renderDrawer(ctx) {
   drawText(ctx, "SCENE", IW - 104, y0 + 2, SILVER);
   for (let i = 0; i < BACKDROPS.length; i++) {
     const bx = IW - 104 + (i % 4) * 25, by = y0 + 11 + Math.floor(i / 4) * 16;
-    ctx.drawImage(BACKDROPS[i].canvas, 0, 0, IW, IH, bx, by, 24, 14);
+    ctx.drawImage(BACKDROPS[i].thumb, 0, 0, IW, IH, bx, by, 24, 14);
     frameRect(ctx, bx, by, 24, 14, live.backdrop === i ? ICE : SLATE);
     uiBtn(bx, by, 24, 14, ((idx) => () => setBackdrop(idx))(i));
   }
@@ -5206,6 +5454,7 @@ function updateTitle(dt) {
 function renderTitle(ctx) {
   ctx.drawImage(BACKDROPS[THEATER_BD].canvas, 0, 0);
   for (const p of titleParade) drawPuppet(ctx, p, { clean: true });
+  if (BACKDROPS[THEATER_BD].fgCanvas) ctx.drawImage(BACKDROPS[THEATER_BD].fgCanvas, 0, 0);
   // big title with a 1px drop shadow (two blits, no blending)
   drawTextC(ctx, "PIXEL PUPPETS", IW / 2 + 1, 27, NIGHT, 2);
   drawTextC(ctx, "PIXEL PUPPETS", IW / 2, 26, SAND, 2);
