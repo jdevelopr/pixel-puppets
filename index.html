@@ -3510,6 +3510,16 @@ function startExport(scenes, title, returnTo, isRetry) {
   }, 16);
 }
 
+/* The picture that goes into the file: the scene and the curtain, and never
+   any of the editor's UI. Both the per-frame capture and the forced final
+   capture paint through here, so the encoder can only ever see a clean
+   frame. (The progress overlay is drawn on top of `screen` AFTER the frame
+   has been handed to the encoder, and only for the person watching.) */
+function drawExportPicture() {
+  renderScene(sctx, play.state, { clean: true, time: playbackClock() });
+  drawShowIntro(sctx, playbackClock());
+}
+
 /* Push one export frame: blit the clean 320x180 up to the export canvas
    (integer 4x) and hand it to the encoder — at most once per 1/30s of SHOW
    time, so the file's frame timestamps land on an even 30fps grid. */
@@ -3528,6 +3538,10 @@ function captureExportFrame(force) {
 function finishExport() {
   if (!exporter || exporter.finishing) return;
   exporter.finishing = true;
+  // this runs from update(), before this frame's render(): `screen` still
+  // holds the PREVIOUS frame, progress overlay included. Repaint it clean
+  // so the last frame of the video is picture, not UI.
+  drawExportPicture();
   captureExportFrame(true);              // make sure the last frame lands
   const ex = exporter;
   try { if (ex.recorder.state === "recording") ex.recorder.requestData(); } catch (e) {}
@@ -5452,8 +5466,7 @@ function render(frameDt) {
     drawShowIntro(sctx, playbackClock());
     renderTransport(sctx);
   } else if (mode === "export") {
-    renderScene(sctx, play.state, { clean: true, time: playbackClock() });
-    drawShowIntro(sctx, playbackClock());       // curtain IS in the video
+    drawExportPicture();                        // curtain IS in the video
     captureExportFrame();                       // export gets the clean frame
     // progress overlay only on the visible screen, never in the file
     const t = clamp(playbackClock(), 0, play.total);
