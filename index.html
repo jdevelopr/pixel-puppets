@@ -4569,6 +4569,7 @@ function hostTick(dt) {
     w: live.weather,
     wip: Math.round(performance.now() - live.wipeAt),
     r: recording ? 1 : 0,
+    cc: (speech.enabled && speech.status === "ready") ? 1 : 0,
     cue: music.playing ? music.playing.track.name : null,
     P: live.puppets.map(p => [p.id, p.x, p.y, p.facing, p.jaw,
       p.expression || "", Math.max(0, Math.round(p.exprT)), Math.max(0, Math.round(p.useT)),
@@ -4632,6 +4633,7 @@ function guestOnData(d) {
       net.mirror.weather = d.w;
       net.mirror.wipeAt = performance.now() - d.wip;
       net.hostRec = !!d.r;
+      net.hostCC = !!d.cc;
       net.cueName = d.cue;
       const seen = new Set();
       for (const row of d.P) { seen.add(row[0]); net.targets.set(row[0], { k: "p", row }); }
@@ -4804,6 +4806,7 @@ function renderNetGuest(ctx) {
     if (Math.floor(performance.now() / 400) % 2) rect(ctx, IW - 78, 3, 5, 5, RED);
     drawTextR(ctx, "REC", IW - 62, 2, RED);
   }
+  if (net.hostCC) drawTextR(ctx, "CC", IW - 82, 2, LIME);
   if (net.cueName) drawTextR(ctx, net.cueName, IW - 88, 2, LIME);
   panel(ctx, IW - 56, 0, 56, 11, DUSK, SLATE);
   drawTextC(ctx, "LEAVE", IW - 28, 2, WHITE);
